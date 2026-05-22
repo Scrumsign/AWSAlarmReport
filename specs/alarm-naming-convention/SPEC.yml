@@ -1,0 +1,145 @@
+# =============================================================================
+# 全体概要
+# =============================================================================
+# 本仕様は HDW_Notify が反応する per-ship CloudWatch Alarm の命名規約を定義する。
+#
+# 背景:
+#   HDW_ML (HDW_Backend_Processor_0001) は 4 時間ごとに複数船舶のデータを処理する。
+#   5 時間以内に成功通知が来ない船舶があれば、その船舶単位で Alarm を発火させ、
+#   HDW_Notify は当該船舶分のログだけをクエリして LLM に渡すという設計に向かう。
+#   そのために Alarm に決定論的な「どの船舶のアラームか」のキャリアが必要で、
+#   その第一段階として AlarmName を per-ship に標準化する。
+#
+# スコープ:
+#   - per-ship Alarm の AlarmName 形式の定義
+#   - 本番用 / テスト用の区別方法
+#   - 本仕様策定以前に作られた旧命名 (TestAlarm) の移行
+#
+# 非スコープ:
+#   - 集約 Alarm (例: 既存の hdw-backend-processor-0001-errors のような複数船舶を
+#     合計して見るもの) の命名。これは本仕様では扱わない別カテゴリ。
+#   - Lambda コードが ship_name を抽出するロジック (cross-account-architecture
+#     側で扱う)。
+#
+# =============================================================================
+
+spec:
+  id: "alarm-naming-convention"
+  version: "1.0.0"
+  title: "per-ship CloudWatch Alarm 命名規約"
+  created_at: "2026-05-21"
+  authors:
+    - name: "scrumsign-takuyakimura"
+
+  constitution:
+    id: "main"
+    version: "1.0.0"
+
+  dependencies:
+    - id: "cross-account-architecture"
+      version: "3.3.0"
+
+  definitions:
+    - term: "production-name"
+      description: |
+        HDW_Notify が監視する Alarm すべてに付与する固定プレフィックス。
+        本プロジェクトでは "hdw" とする。
+        本仕様の AlarmName 形式 ``<production-name>-<ship-name>[-test]`` の先頭セグメント。
+        プロジェクト単位で固定であり、SPEC の version up 無しに変更してはならない。
+
+    - term: "ship-name"
+      description: |
+        HDW_ML が処理対象とする個々の船舶を一意に識別する文字列。
+        小文字英数字とハイフンで構成する。
+        例: "sakura", "shimakaji"。
+        AlarmName 形式 ``<production-name>-<ship-name>[-test]`` の中央セグメント。
+
+    - term: "per-ship Alarm"
+      description: |
+        単一の船舶に対応する CloudWatch Alarm。
+        AlarmName で どの船舶か を識別でき、かつ Dimensions に同じ ship_name を持つ。
+        本仕様はこの per-ship Alarm のみを対象とする。
+
+    - term: "本番 Alarm / テスト Alarm"
+      description: |
+        本番 Alarm:
+          実環境のメトリクスを監視し、実際の運用異常を検知する用途の Alarm。
+          AlarmName は ``<production-name>-<ship-name>``。
+        テスト Alarm:
+          手動発火による配線検証や、新コードのスモークテスト用の Alarm。
+          AlarmName は ``<production-name>-<ship-name>-test``。
+          自然発火しないよう Dimensions を架空関数等に向けることがあるが、
+          本仕様は AlarmName のみを規定し、Dimensions の組み方は問わない。
+
+  requirements:
+    - id: "REQ-001"
+      title: "per-ship Alarm の AlarmName は <production-name>-<ship-name>[-test] 形式とする"
+      description: |
+        per-ship Alarm の AlarmName は以下の固定フォーマットに従う。
+
+        本番 Alarm:
+          <production-name>-<ship-name>
+          例: hdw-sakura / hdw-shimakaji
+
+        テスト Alarm:
+          <production-name>-<ship-name>-test
+          例: hdw-sakura-test / hdw-shimakaji-test
+
+        - 各セグメントは小文字英数字のみで構成する (大文字・アンダースコア禁止)。
+        - 区切り文字はハイフン (``-``)。
+        - "-test" 接尾辞はテスト Alarm にのみ付ける。本番 Alarm には付けない。
+        - production-name は本仕様の definitions により "hdw" 固定。
+      acceptance_criteria:
+        - id: "AC-001-1"
+          description: |
+            本番 per-ship Alarm の AlarmName が正規表現
+            ``^hdw-[a-z][a-z0-9]*$``
+            にマッチする。
+        - id: "AC-001-2"
+          description: |
+            テスト per-ship Alarm の AlarmName が正規表現
+            ``^hdw-[a-z][a-z0-9]*-test$``
+            にマッチする。
+        - id: "AC-001-3"
+          description: |
+            同一船舶の本番 Alarm とテスト Alarm が同じ AWS アカウント / リージョンに
+            共存しても、AlarmName の "-test" 接尾辞の有無のみで両者を区別でき、衝突しない。
+            (例: ``hdw-sakura`` と ``hdw-sakura-test`` が同居しても干渉しない)
+
+    - id: "REQ-002"
+      title: "旧命名 TestAlarm を hdw-sakura-test に移行する"
+      description: |
+        本仕様策定以前に作られた ``TestAlarm`` (本番アカウント 920373030024) は
+        REQ-001 に従わないため、新名 ``hdw-sakura-test`` に移行する。
+
+        CloudWatch Alarm は API 上 rename をサポートしないため、移行は
+        「新名で put-metric-alarm → 旧名を delete-alarms」 の 2 ステップで行う。
+
+        移行時に以下の構成情報を変更してはならない (= 移行は命名のみの変更で
+        ある):
+
+          - Metric: AWS/Lambda / Errors / Sum / Period=300 / EvaluationPeriods=1
+          - Threshold=1, ComparisonOperator=GreaterThanOrEqualToThreshold
+          - TreatMissingData=notBreaching
+          - Dimensions: FunctionName=TestFunction-DoesNotExist, ship_name=sakura
+          - AlarmActions: arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic
+      acceptance_criteria:
+        - id: "AC-002-1"
+          description: |
+            本番アカウント (920373030024 / ap-northeast-1) に AlarmName "TestAlarm" の
+            Alarm が存在しない。
+        - id: "AC-002-2"
+          description: |
+            本番アカウントに AlarmName "hdw-sakura-test" の Alarm が存在し、
+            その Dimensions が
+            ``[{Name=FunctionName, Value=TestFunction-DoesNotExist}, {Name=ship_name, Value=sakura}]``
+            (順序は問わない) と一致する。
+        - id: "AC-002-3"
+          description: |
+            hdw-sakura-test の AlarmActions に
+            ``arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic`` が含まれる。
+        - id: "AC-002-4"
+          description: |
+            hdw-sakura-test の MetricName / Namespace / Threshold / Period /
+            EvaluationPeriods / ComparisonOperator / TreatMissingData が
+            REQ-002 description で列挙した値とすべて一致する (構成情報の保存)。

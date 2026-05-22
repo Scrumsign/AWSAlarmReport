@@ -1,0 +1,53 @@
+plan:
+  spec:
+    id: "alarm-naming-convention"
+    version: "1.0.0"
+  rev: 1
+  created_at: "2026-05-21"
+
+  tasks:
+    - id: "TASK-001"
+      req: "REQ-002"
+      title: "新名 hdw-sakura-test を put-metric-alarm で新規作成する"
+      description: |
+        既存 TestAlarm と同じ構成 (REQ-002 で列挙した項目) で hdw-sakura-test を
+        新規作成する。Tag は本仕様トレーサビリティのため新規に貼り直す。
+
+        コマンド:
+          aws cloudwatch put-metric-alarm \
+            --alarm-name hdw-sakura-test \
+            --alarm-description "Per-ship test alarm for ship_name=sakura. Cross-account wiring + ship_name propagation test. Dimensions point to a non-existent function so it never natural-fires; trigger via aws cloudwatch set-alarm-state." \
+            --metric-name Errors \
+            --namespace AWS/Lambda \
+            --statistic Sum \
+            --period 300 \
+            --evaluation-periods 1 \
+            --threshold 1 \
+            --comparison-operator GreaterThanOrEqualToThreshold \
+            --dimensions Name=FunctionName,Value=TestFunction-DoesNotExist Name=ship_name,Value=sakura \
+            --treat-missing-data notBreaching \
+            --alarm-actions arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic \
+            --tags Key=ManagedBy,Value=HDW_Notify Key=Spec,Value=alarm-naming-convention Key=SpecVersion,Value=1.0.0 Key=Purpose,Value=cross-account-wiring-test Key=Ship,Value=sakura \
+            --profile hanshin-t.kimura --region ap-northeast-1
+
+        実行後 describe-alarms で新名 alarm が State=INSUFFICIENT_DATA or OK で
+        存在することを確認してから次タスクへ進む。
+
+    - id: "TASK-002"
+      req: "REQ-002"
+      title: "旧名 TestAlarm を delete-alarms で削除する"
+      description: |
+        TASK-001 で新名 alarm の存在を確認した後、旧名 TestAlarm を削除する。
+        この時点では client 側 SNS topic に subscribe している HDW_Notify Lambda
+        の resource policy は SNS 経由の invoke を許可しているのみであり、
+        AlarmName そのものに依存していないため、Lambda の動作には影響しない。
+
+        コマンド:
+          aws cloudwatch delete-alarms --alarm-names TestAlarm \
+            --profile hanshin-t.kimura --region ap-northeast-1
+
+        ロールバック:
+          万一新 Alarm 側に不備があった場合、TASK-001 と同じコマンドで
+          alarm-name のみ TestAlarm に戻して put-metric-alarm を再実行すれば
+          旧状態を再現できる。Dimensions / Actions など構成は本仕様内で完全に
+          ドキュメント化されているため、TestAlarm の構成は失われない。

@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudWatchPublish",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudwatch.amazonaws.com" },
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic",
+      "Condition": {
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:cloudwatch:ap-northeast-1:920373030024:alarm:*"
+        },
+        "StringEquals": {
+          "aws:SourceAccount": "920373030024"
+        }
+      }
+    },
+    {
+      "Sid": "AllowCrossAccountSubscribe",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::088898720463:root" },
+      "Action": ["SNS:Subscribe", "SNS:Receive"],
+      "Resource": "arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic"
+    }
+  ]
+}

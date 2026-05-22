@@ -1,0 +1,40 @@
+```json
+{
+  "summary": "[処理失敗] main.py:62 で general_data が None のまま処理進行、同一 ZIP が 3 回連続失敗",
+  "severity": "HIGH",
+  "confidence": "high",
+  "root_cause_hypothesis": "main.py:62 の main_function() で general_data 変数が None のまま到達している。ZIP 解凍後の validation complete までは成功しているため、解凍後のデータ抽出ロジック (main.py:62 前後) で条件分岐を満たさないか、必須フィールドが ZIP に不在の可能性が最有力。同一 ship=sakura, ts=20260427120100 が 3 度のリトライで一貫して失敗しており、入力データ異常 (ZIP 構造不整合・必須フィールド欠落) が根本原因と判断。",
+  "suggested_actions": [
+    "main.py:62 の直前 (line 55-61) で general_data の値とタイプをログ出力し、None に至る経路を特定する。特に解凍ファイル名・パス・フィールド抽出ロジックを確認。",
+    "inputFiles/sakura-20260427120100.zip を S3 から取得し、ZIP 内部構造と必須ファイル / JSON キーの存在を手動検証。validation complete までの処理フローと矛盾がないか確認。",
+    "main.py:62 の条件チェックを 'general_data is None' から 'if general_data is None: log(<actual_value>, <extraction_context>); raise ...' に修正し、次発生時の切り分けを加速する。恒久的には ZIP スキーマバリデーションを解凍直後に追加。"
+  ]
+}
+```
+
+---
+
+### 補足解釈
+
+**パターン判定**: **(B) 起動して失敗**  
+Lambda は S3 イベントで正常起動し、ZIP DL → 解凍 → validation complete まで進行。しかし `main.py:62` で `ValueError('general_data is None')` が raise され、エラーログ出力。
+
+**同一 ZIP の 3 回失敗パターン**:
+- **Attempt 1** (06:33:30-06:33:36): cold start、exception at line 62
+- **Attempt 2** (06:34:35-06:34:39): warm start、同じ exception
+- **Attempt 3** (06:36:48-06:36:52): 同じ exception
+
+再試行前に入力が変わっていないため、**コードバグ (특정 조건 미충족)** または **ZIP 内容の永続的異常** のいずれか。
+
+**判断根拠**:
+1. `extraction complete` と `validation complete` が成功しているため、ZIP の基本的な整合性と初期 validation は通過
+2. しかし `main_function()` 内の後続ロジックで `general_data` が構築されない → 조건분岐 미충족 or 필수필드 부재
+3. 동일 ship/ts 반복실패 → 데이터 이상 가능성 높음 (코드 버그라면 다른 이유로 일부 성공해야 함)
+
+**confidence: high** の根拠:
+- Stack trace が明確に `main.py:62` の `raise ValueError('general_data is None')` を指摘
+- 동일 입력, 동일 실패점 반복
+- 정상 단계(해제, 검증)는 통과
+
+=== usage ===
+{"inputTokens": 7441, "outputTokens": 1001, "totalTokens": 8442, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}

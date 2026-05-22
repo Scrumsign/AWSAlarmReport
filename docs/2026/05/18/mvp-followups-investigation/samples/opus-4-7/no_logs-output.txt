@@ -1,0 +1,14 @@
+{
+  "summary": "[未起動] 直近窓内にerror/successログなし、S3アップロード未着の疑い",
+  "severity": "HIGH",
+  "confidence": "medium",
+  "root_cause_hypothesis": "最有力: 上流のZIPアップロード処理(船側送信/別Lambda/手動転送)の失敗・遅延でS3イベントが発火せずLambda未起動。次点: S3イベント通知設定の破損。低確度: cold start時のlogger初期化前クラッシュ、CloudWatch Logs配信遅延。",
+  "suggested_actions": [
+    "S3バケットのinputFiles/配下に直近4hでZIP着信があるかCloudTrailで確認",
+    "Lambda Invocationsメトリクスと上流アップロード処理の実行ログを突合し起動有無を切り分け",
+    "S3→Lambdaイベント通知設定の死活監視と上流アップロード成功通知の追加を検討"
+  ]
+}
+
+=== usage ===
+{"inputTokens": 2085, "outputTokens": 342, "totalTokens": 2427, "cacheReadInputTokens": 0}

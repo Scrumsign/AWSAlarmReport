@@ -1,0 +1,544 @@
+changelog:
+  - date: "2026-05-21"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "3.3.0"
+      to: "3.4.0"
+    trigger: internal
+    reason: |
+      ExternalId 採用を撤回。HDW_Notify のアーキテクチャでは confused deputy 攻撃が
+      構造的に発生せず、ExternalId は独立した security layer として機能しないと
+      再評価したため。本変更は SPEC 表記上の精度向上ではなく実装・運用にも影響する
+      decision (= breaking) のため version_up。
+
+      根拠 (REQ-003 description に転記済):
+      - HDW_Notify は SaaS ポータルを持たず、AssumeRole 対象 RoleArn は
+        Lambda env var (CROSS_ACCOUNT_ROLE_ARN) にハードコードされる。
+        外部入力から RoleArn を組み立てる経路が存在せず、role-assuming 側で
+        発生する confused deputy 攻撃 (悪意ある顧客 B が被害者 A の RoleArn を
+        submit する形) は構造的に発生しない。
+      - 将来多顧客化する場合も、routing key を SNS-controlled fields
+        (Sns.TopicArn / EventSubscriptionArn) に取る不変条件を守れば confused
+        deputy は発生しない (Sns.Message 本体は publisher 制御で routing key に
+        使用してはならない)。
+      - ExternalId は AWS 公式上 "not a secret" であり (IAM User Guide /
+        id_roles_common-scenarios_third-party)、Trust Policy 編集権限を持つ者は
+        sts:ExternalId 条件ごと書き換え可能。独立した認証要素にならない。
+      - AssumeRole の真の security boundary は Trust Policy の Principal 限定
+        (現状 hdw-notify-execution-role を完全指定) と、Lambda 実行ロールを
+        引き受け得る IAM principal の最小化で得られている。
+      - hanshin 内部不正への防御は ExternalId のスコープ外
+        (Trust Policy 編集権限を持つ者は条件ごと書き換え可能)。
+
+      SPEC 変更:
+      - definitions から ExternalId 項目を削除。
+      - REQ-003 description を ExternalId 必須要件から ExternalId 不採用根拠の
+        記述に書き換え。AC-003-1 から ExternalId フィールド記録要件を削除。
+      - 旧 AC-003-2 (ExternalId 生値非混入) を削除し、旧 AC-003-3 (fallback
+        embed) を AC-003-2 に詰める。新 AC-003-3 として「Trust Policy が
+        sts:ExternalId 条件を持たず Principal が execution-role に限定」を追加。
+      - REQ-007 description / 構成図コメントから ExternalId 参照を削除。
+
+      実装影響 (PLAN rev 6 / TEST rev 6 で追従):
+      - src/main.py: assume_role 呼出から ExternalId 引数除去、Env から
+        external_id 除去。
+      - deploy/config*.yml: EXTERNAL_ID キーを追加しない。
+      - .github/workflows/deploy.yml: EXTERNAL_ID env / jq Variables / 必須
+        チェックを追加しない (既存があれば除去)。
+      - hanshin 側 HDWNotifyLogReader Trust Policy: StringEquals.sts:ExternalId
+        条件を除去 (Principal の execution-role 完全指定は維持)。
+      - GitHub Secret EXTERNAL_ID_HANSHIN: 新規登録不要 (既存があれば削除)。
+
+  - date: "2026-05-21"
+    type: rev_up
+    target:
+      file: plan
+      id: "cross-account-architecture"
+      from: "rev 5 @ spec 3.3.0"
+      to: "rev 6 @ spec 3.4.0"
+    trigger: internal
+    reason: |
+      SPEC v3.4.0 (ExternalId 不採用) に追従。
+
+      変更:
+      - TASK-002 Trust Policy から StringEquals.sts:ExternalId 条件を除去し、
+        「ExternalId 値の生成と取り扱い」サブセクション全文を削除。
+        Principal が execution-role に完全限定されていることが security boundary
+        である旨を明記。
+      - TASK-004 Env dataclass の追加項目から external_id を削除、assume_role 呼出
+        から ExternalId= 引数を削除。
+      - TASK-005 末尾「ExternalId は config YAML に書かない」注記を、既存環境での
+        ops 片付けへの誘導 (TASK-011 参照) に置換。
+      - TASK-006 deploy.yml 更新手順から EXTERNAL_ID env / jq Variables / 必須
+        チェック / Secret 登録手順を削除。
+      - TASK-010 単独手動検証手順 (PowerShell) から ExternalId Read-Host /
+        --external-id フラグ / Trust Policy の StringEquals 維持注記を削除。
+      - TASK-011 (新規) として「既存 ExternalId 関連アーティファクトの片付け
+        (Lambda env / Trust Policy / GitHub Secret)」を追加。新規環境では no-op、
+        既存環境では除去対象を明示する手順。
+
+  - date: "2026-05-21"
+    type: rev_up
+    target:
+      file: test
+      id: "cross-account-architecture"
+      from: "rev 5 @ plan rev 5"
+      to: "rev 6 @ plan rev 6"
+    trigger: internal
+    reason: |
+      SPEC v3.4.0 / PLAN rev 6 連動。
+
+      変更:
+      - 旧 TC-003-3 (ExternalId 生値の SPEC / config / git 履歴非混入の静的検査)
+        を削除。対応 AC (旧 AC-003-2) 自体が SPEC から削除されたため。
+      - TC-003-2 を新 AC-003-2 (旧 AC-003-3, fallback embed) に対応するよう
+        AssumeRole 失敗誘発手順を「EXTERNAL_ID 誤値投入」から
+        「CROSS_ACCOUNT_ROLE_ARN を存在しない RoleArn に差し替え」に変更。
+      - 新 TC-003-3 を新 AC-003-3 (Trust Policy に sts:ExternalId 条件不存在)
+        として追加。`aws iam get-role` の AssumeRolePolicyDocument を取得し、
+        Statement[].Condition に sts:ExternalId が無いこと、Principal.AWS が
+        hdw-notify-execution-role に限定されていることを静的検査する。
+      - TC-007-1 PowerShell 手順から ExternalId Read-Host / --external-id
+        フラグ / ExternalId 履歴非残存チェックを削除。クリーンアップ後の
+        AccessDenied 確認コマンドからも --external-id 引数を除去。
+
+  - date: "2026-05-21"
+    type: version_up
+    target:
+      file: spec
+      id: "alarm-naming-convention"
+      from: "(new)"
+      to: "1.0.0"
+    trigger: internal
+    reason: |
+      per-ship CloudWatch Alarm の命名規約を新規 SPEC として策定。
+
+      動機: HDW_ML は 4 時間毎に複数船舶のデータを処理する設計で、5 時間以内に
+      成功通知が来ない船舶があれば船舶単位で Alarm を発火させ、HDW_Notify は
+      該当船舶分のログだけを LLM に渡すという per-ship 化に向かう。
+      その第一段階として、Alarm にどの船舶のものかを決定論的に乗せる必要があり、
+      AlarmName 形式を <production-name>-<ship-name>[-test] に標準化する。
+      Dimensions 経由の ship_name 伝搬は cross-account-architecture 側で実施し、
+      本仕様は AlarmName の命名のみを規定する。
+
+      旧名 TestAlarm はこの規約に従わないため、新名 hdw-sakura-test に
+      移行する (REQ-002)。put-metric-alarm で新名を作り、delete-alarms で
+      旧名を消す 2 step 移行で、構成情報は完全に維持する。
+
+      cross-account-architecture (3.3.0) の TASK-008 で作られている
+      集約 Alarm hdw-backend-processor-0001-errors は本仕様の対象外
+      (per-ship ではない集約 Alarm)。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "3.2.0"
+      to: "3.3.0"
+    trigger: internal
+    reason: |
+      Logs Insights クロスアカウント取得の単独手動検証手段を SPEC に追加。
+      Reporter Lambda 経由の E2E (REQ-006) を回す前段で、AssumeRole +
+      logs:StartQuery / GetQueryResults が単独で完走することを確認できる
+      手順を REQ-007 として要件化。AC-007-1〜3 で「自社オペレータからの
+      HDWNotifyLogReader 引き受け手順の存在」「start-query が Complete を返す」
+      「GetCallerIdentity が 920373030024:assumed-role/HDWNotifyLogReader を
+      返す」を担保する。
+
+      動機: E2E が失敗したとき、Lambda コード / SNS 配線 / Bedrock 側 / IAM の
+      どこで詰まっているかを切り分けるためには、Logs Insights 経路だけを単独で
+      検証できる手段が必要。これまではすべての検証が Lambda 経由でしか行えず、
+      切り分けの粒度が粗かった。
+
+      REQ-001〜006 と AC は無変更。新規 REQ 追加なので minor up。
+      PLAN は TASK-010 (検証手順整備) を追加し rev 4 → 5、
+      TEST は TC-007-1 (手動検証実施) を追加し plan_rev 4 → 5 / rev 4 → 5。
+      実装変更不要 (Lambda コードと AWS 恒久リソースに変更を残さない
+      検証手順のため、deploy/config*.yml / src/main.py / .github/ 変更なし)。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: plan
+      id: "cross-account-architecture"
+      from: "rev 4 @ spec 3.1.0"
+      to: "rev 5 @ spec 3.3.0"
+    trigger: internal
+    reason: |
+      SPEC v3.3.0 (REQ-007 追加) に追従。TASK-010 (クロスアカウント Logs Insights
+      単独手動検証の手順整備) を追加。AC-007-1 (b) (自社オペレータ ARN を
+      HDWNotifyLogReader Trust Policy に一時追加する経路) を推奨ルートとして
+      PowerShell で記述。検証完了後に Trust Policy を元に戻すクリーンアップ手順も
+      含む。TASK-001〜009 は本文・依存 REQ ともに変更なし。新規コード実装は不要。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "cross-account-architecture"
+      from: "rev 4 @ plan rev 4"
+      to: "rev 5 @ plan rev 5"
+    trigger: internal
+    reason: |
+      PLAN rev 5 (TASK-010 追加) 連動と REQ-007 追加への対応。
+      TC-007-1 (TASK-010 手順を実機実行し AC-007-1〜3 を一括検証する手動 TC) を追加。
+      合格条件として GetCallerIdentity の Arn / start-query の status="Complete" /
+      検証用 Trust 削除後の AccessDenied / ExternalId 生値の履歴非残存 を判定する。
+      TC-001-1〜TC-006-3 は変更なし。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "3.1.0"
+      to: "3.2.0"
+    trigger: internal
+    reason: |
+      SPEC ファイル冒頭に「全体概要」セクションと「構成図 (Alarm 起爆 → Discord
+      通知)」を追記。クライアントアカウントと自社アカウントの責務境界、
+      および (1)〜(6) の処理ステップに対し本 SPEC が規定する REQ-002〜005 が
+      どこにかかっているかを 1 枚で俯瞰できるようにした。
+
+      要件本文 (REQ-001〜006 / AC) は無変更。ドキュメント表現のみの拡張で
+      backward-compatible (minor up)。実装変更不要、PLAN / TEST も無変更。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "3.0.0"
+      to: "3.1.0"
+    trigger: internal
+    reason: |
+      デプロイ目標を「Reporter Lambda がクライアント側 Alarm 発火を契機に
+      cross-account でクライアント運用 Lambda のログ直近 30 分を取得し、
+      LLM 生成まで通せること」に絞り込んだことに伴い、E2E シナリオを単一の
+      検証シナリオとして担保する REQ-006 を追加。
+
+      REQ-001〜005 は構成要件 (配置・SNS Policy・AssumeRole・LOG_GROUP_MAP・
+      時間窓) を個別に規定しているが、それらが組み合わさって「一気通貫で
+      動くこと」を AC として明示する単一の REQ が無かった。最小要件として
+      E2E が通ることを検証可能にするため backward-compatible に追加 (minor up)。
+
+      実装変更は不要。既存の src/main.py / deploy/config*.yml /
+      .github/workflows/deploy.yml がそのまま REQ-006 を満たす想定。
+      PLAN は TASK-009 (E2E 検証手順整備) を追加し rev 3 → 4、
+      TEST は TC-006-1/2/3 を追加し plan_rev 3 → 4 / rev 3 → 4。
+
+      当初 S3 zip アップロード経路 (test-zip-management SPEC) を併用した
+      検証を想定していたが、本 SPEC のスコープから外し、Alarm → Bedrock の
+      フロー検証に絞る方針に整理。test-zip-management SPEC は本 SPEC と
+      独立した別 SPEC のため、本変更で除外宣言や参照変更は行わない。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: plan
+      id: "cross-account-architecture"
+      from: "rev 3 @ spec 3.0.0"
+      to: "rev 4 @ spec 3.1.0"
+    trigger: internal
+    reason: |
+      SPEC v3.1.0 (REQ-006 追加) に追従。TASK-009 (E2E 検証手順整備と
+      docs/operations.md への E2E セクション追記) を追加。
+      TASK-001〜008 は本文・依存 REQ ともに変更なし。
+      新規コード実装は不要で、ドキュメント整備と試験ハーネス確認のみ。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "cross-account-architecture"
+      from: "rev 3 @ plan rev 3"
+      to: "rev 4 @ plan rev 4"
+    trigger: internal
+    reason: |
+      PLAN rev 4 (TASK-009 追加) 連動と REQ-006 追加への対応。
+      TC-006-1 (Discord embed 着弾) / TC-006-2 (生成内容が fallback 文言でない)
+      / TC-006-3 (Lambda 実行ログに assumed_role_arn / rows > 0 / Bedrock 正常完了
+      が記録される) を追加。TC-001-1〜TC-005-2 は変更なし。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "2.0.0"
+      to: "3.0.0"
+    trigger: internal
+    reason: |
+      v2.0.0 の前提 (HDW_Notify が hanshin/920373030024 に同居デプロイされており、
+      自社アカウントへ "big-bang cutover" で移行する) が事実誤認だったため、
+      初期構築前提に訂正。
+
+      実態 (リポジトリと運用ドキュメントから判明):
+        - HDW_Lambda_Notifier_0001 は hdw-test (088898720463) にのみ存在し、
+          bootstrap 状態。CloudWatch Alarm 配線が未着手のため呼ばれていない。
+        - hanshin 側に HDW_Notify Lambda は存在しない。
+        - docs/operations.md L99 "本番 (production environment) は未整備。
+          本番 Lambda / ECR / IAM ロール / deploy/config-prod.yml の値は
+          すべて別アカウントで再構築予定"。
+        - docs/operations.md L157-171 §「CloudWatch Alarm 配線（未着手）」。
+
+      訂正内容:
+        - REQ-001: title を「自社アカウントへ集約する」→「自社アカウント側に
+          のみ配置する」、description から「現状クライアントアカウントに
+          同居デプロイされている」「big-bang cutover」「並走期間なし」の
+          記述を撤去し、bootstrap 状態の Lambda を本番運用に投入する構築仕様で
+          あることを明示。
+        - 用語集「自社アカウント」: 「prod 昇格」→「test 環境として用意済みで
+          本番運用ロールも兼ねる稼働を開始」に修正。
+        - 用語集「クライアントアカウント」: 説明から「同居」を含む文言を除去し、
+          「SNS Topic と IAM Role を新規に提供してもらう (HDW_Notify Lambda 本体
+          はこのアカウントには配置しない)」と明示。
+        - PLAN TASK-008: 「Alarm Action を Lambda invoke → SNS Publish に
+          差し替え」を「CloudWatch Alarm を新規作成し AlarmAction を SNS Topic
+          に指定する」に書き直し。
+        - PLAN TASK-009 (旧 Lambda 停止・削除): 対象不在のため完全削除。
+        - TEST TC-001-1: 合格条件文言から「旧 Lambda が削除済み」「disable のみ
+          で実施中」を除去し、「初期構築仕様であり、クライアント側に Lambda が
+          存在したことは過去にも無い」と明示。
+        - 用語集「OAM」: v2.0.0 で書いた「big-bang cutover の AssumeRole 設計が
+          承認済み」という理由を削除し、初期構築段階での選択理由に置き換え。
+
+      実装 (src/main.py / deploy/*.yml / .github/workflows/deploy.yml) の挙動は
+      v2.0.0 と同じ TO BE を志向していたため、コード差分の作り直しは不要。
+      文書側のみの訂正で整合する。
+
+      別途フォロー対象 (本 SPEC のスコープ外):
+        - docs/operations.md §「CloudWatch Alarm 配線（未着手）」が
+          Lambda 直接 invoke 想定で古い。SNS + AssumeRole 配線に追従更新が必要。
+        - README.md L11-16 のアーキテクチャ図も同様に古い。
+        - specs/CONSTITUTION.yml の用語集「本番アカウント / テストアカウント」が
+          「デプロイ先か監視対象か」を曖昧にしており、本誤認の遠因。明確化が必要。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "1.0.0"
+      to: "2.0.0"
+    trigger: internal
+    reason: |
+      AWS 公式仕様 (CloudWatch Notify_Users_Alarm_Changes / IAM
+      id_roles_common-scenarios_third-party / SNS sns-access-policy-use-cases /
+      Lambda with-sns / CloudWatch-Unified-Cross-Account) と SPEC v1.0.0 を
+      照合した結果、以下 3 点の齟齬を検出したため version up。
+      実装挙動 (src/main.py / deploy/*.yml / .github/workflows/deploy.yml)
+      は変更不要で、SPEC / PLAN / TEST の記述精度向上のみ。
+
+      (1) REQ-002 / AC-002-1: SNS Topic Policy の Publish 文に
+          aws:SourceArn 条件 (ArnLike Alarm ARN ワイルドカード) が欠落。
+          公式は "most effective way to protect against the confused deputy
+          problem is to use the aws:SourceArn global condition context key
+          with the full ARN of the resource" と明記。
+          aws:SourceArn + aws:SourceAccount 併用パターンに修正。
+      (2) REQ-003 / AC-003-2: ExternalId を「機密」と表現していたが、
+          AWS 公式は明示的に "AWS does not treat the external ID as a secret"。
+          公式準拠で「secret ではないが、攻撃面縮小と git/log 漏洩防止のため
+          GHA Secret 経由で投入する運用衛生値」と再定義。生成主体が
+          「role を引き受ける側 (自社 HDW_Notify)」である点も明記
+          ("It must be generated by Example Corp and not their customers")。
+      (3) definitions: CloudWatch Cross-Account Observability (OAM, 2022 年導入)
+          を将来代替案として note 追加。クライアント 3+ で再評価対象。
+
+      PLAN は spec 参照 1.0.0→2.0.0、rev 1→2 に更新し、TASK-001 の Topic
+      Policy JSON と TASK-002 の ExternalId 取扱い記述を追従。
+      TEST は spec 参照 1.0.0→2.0.0、plan_rev 1→2、rev 1→2 に更新し、
+      TC-002-1 (Topic Policy 検査) に aws:SourceArn 条件チェックを追加、
+      新規 TC-003-3 (ExternalId 生値の SPEC / config / git 履歴混入禁止) を追加。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "cross-account-architecture"
+      from: "(new)"
+      to: "1.0.0"
+    trigger: internal
+    reason: |
+      新規 SPEC 起草。HDW_Notify を hanshin 同居デプロイから自社アカウント
+      (088898720463) 集約 + SNS Topic + STS AssumeRole 経由のクロスアカウント
+      構成へ big-bang cutover する。クライアント数 1 (hanshin) を前提に
+      EventBridge / DynamoDB マッピングは採用せず、env var (LOG_GROUP_MAP /
+      EXTERNAL_ID / CROSS_ACCOUNT_ROLE_ARN) で構成 (PRIN-001 準拠)。
+      初版時点で実装 (src/main.py / deploy/config*.yml /
+      .github/workflows/deploy.yml) と AWS 側作業項目 (PLAN TASK-001〜009)
+      を SPEC v1.0.0 に同期。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "test-zip-management"
+      from: "rev 4 @ plan rev 3"
+      to: "rev 5 @ plan rev 3"
+    trigger: internal
+    reason: |
+      positive test（合致ケース pass）のみだった TEST に negative test
+      （不一致ケース fail 検出）を追加し、verify_test_zip.py が「常に
+      pass を返すダミー検証ではない」ことを証明可能にする。
+
+      追加: TC-005-1 〜 TC-005-6 の 6 ケース。3 個の生成 ZIP
+      （TC-B-3, TC-B-5, TC-S-1）を 3 個の verify mode の組み合わせから
+      不一致 6 通りすべてカバー。各 TC は対応する positive AC の
+      感度確認として ac を割り当てる。
+
+      verify_test_zip.py 側に --expect-fail オプションを追加（PLAN 側
+      の変更は無し。本 flag は TEST 専用のテスト実行支援機能であり、
+      検証ロジック自体は変えていない）。
+
+      副次修正: Windows コンソール (cp932) で mojibake 文字を含む
+      print が UnicodeEncodeError で落ちる問題に対応するため、
+      verify_test_zip.py 起動時に stdout/stderr を utf-8 + errors=replace
+      へ reconfigure する処置を追加（TC-005-3 / TC-005-5 で再現）。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: plan
+      id: "test-zip-management"
+      from: "rev 2 @ spec 2.0.0"
+      to: "rev 3 @ spec 2.0.0"
+    trigger: internal
+    reason: |
+      TC-003-1 (verify_tcb5) 着手時、生成 TC-B-5 ZIP は zipfile の自動判定で
+      UTF-8 フラグが立つことが判明。PLAN rev 2 の _real_filename は
+      UTF-8 フラグ短絡分岐で「フラグありなら原文を返す」設計だったため、
+      生成 ZIP の filename（実体は mojibake の UTF-8 エンコード）を
+      そのまま返してしまい、regex が `定時|任意` に一致しない。
+
+      対策として UTF-8 フラグ短絡を撤廃し、常時 cp437→cp932 ラウンドトリップを
+      試行する universal 実装へ変更。3 ケース（base ZIP / 生成 ZIP /
+      真の UTF-8 ZIP）すべて一律に正しい日本語へ復元できる。
+      make_test_zip.py（PLAN）と verify_test_zip.py（TEST）の両ヘルパーを
+      同一実装に揃える方針。
+
+      PLAN rev 3 の変更範囲: TASK-004 description の前提ヘルパー定義部のみ。
+      tcb5_transform 本体ロジックは変更なし。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "test-zip-management"
+      from: "rev 3 @ plan rev 2"
+      to: "rev 4 @ plan rev 3"
+    trigger: internal
+    reason: |
+      PLAN rev 3 連動。TC-001-2 description の _real_filename 定義を
+      universal 実装に追従させる。SDD「PLAN 修正は TEST 新規」規約への対応。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "test-zip-management"
+      from: "rev 2 @ plan rev 2"
+      to: "rev 3 @ plan rev 2"
+    trigger: internal
+    reason: |
+      TC-001-2 (verify_base) の実装過程で、本番 ZIP の filename が cp437
+      mangled な状態で zipfile から返るため、TEST rev 2 の description の
+      regex を info.filename にそのまま当てると 17/17 のエントリが
+      不一致になる現象を確認した（PLAN TASK-004 と同様）。
+
+      対策として _real_filename(info) ヘルパー（cp437→cp932 ラウンドトリップ）
+      を verify_test_zip.py 側にも実装し、regex を _real_filename(info) に
+      当てる方式に変更。TEST description にこのヘルパー定義と利用方法を追記。
+
+      TEST rev 3 の変更範囲: TC-001-2 description のみ。他 TC は未着手であり
+      実装過程で類似の rev_up が発生する見込み（TC-003-1 等）。
+      plan_rev は 2 のまま据え置き（PLAN 側の変更ではないため）。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: plan
+      id: "test-zip-management"
+      from: "rev 1 @ spec 2.0.0"
+      to: "rev 2 @ spec 2.0.0"
+    trigger: internal
+    reason: |
+      TASK-004 (tcb5_transform) の実装過程で、PLAN rev 1 の記述に
+      以下 3 点の不足が判明した:
+
+      (1) 本番 ZIP は UTF-8 フラグ未設定で filename が cp932 raw bytes
+          として格納される。zipfile はこれを cp437 として decode するため、
+          PLAN の regex を info.filename にそのまま当てると日本語
+          ディレクトリ名 (定時/任意) が化けて一致しない。
+          cp437→cp932 ラウンドトリップを行う _real_filename ヘルパーが必要。
+
+      (2) CSV の最終行が改行で終わらないケースで PLAN の
+          `eol = "\r\n" if endswith else "\n"` 二分岐が誤った改行を
+          付与する。else "" を含む三分岐に拡張する。
+
+      (3) 2 行目アクセス前に len(lines) < 2 を SystemExit で弾く
+          チェックが PLAN で暗黙だった。明示する。
+
+      これらは PLAN の実装精度の問題であり、TEST の検証手段
+      （AC-003-1 / AC-003-2 の合否判定）には影響しない。
+      ただし SDD 規約「PLAN 修正は TEST 新規」に従い TEST も rev 2 へ
+      連動 bump（plan_rev 1→2、内容は維持）。
+
+  - date: "2026-05-20"
+    type: rev_up
+    target:
+      file: test
+      id: "test-zip-management"
+      from: "rev 1 @ plan rev 1"
+      to: "rev 2 @ plan rev 2"
+    trigger: internal
+    reason: |
+      PLAN rev 2 への連動 bump。TC 本文に変更なし。
+      SDD「PLAN 修正は TEST 新規」規約への形式的対応。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "test-zip-management"
+      from: "1.0.0"
+      to: "2.0.0"
+    trigger: internal
+    reason: |
+      v1.0.0 SPEC は description に「生成コマンド: python scripts/make_test_zip.py ...」を
+      埋め込み、PLAN は make_test_zip.py の利用と検証スニペットを混在させていた
+      （形骸化アンチパターン「仕様がタスクリストになる」「過剰仕様」）。
+      また REQ-005「S3 inputFiles/ への投入」は ZIP 管理の責務外
+      （試験実施＝production-operation-test-v2 の責務）であり、循環依存も発生していた
+      （test-zip-management → production-operation-test-v2@1.0.0 → test-zip-management@1.0.0）。
+
+      v2.0.0 では SPEC を「テスト用 ZIP の生成・管理」のみに絞り、
+      REQ-005 を削除して循環依存を解消。SPEC description から実装コマンドを除去し、
+      AC のみ検証可能な形に維持。PLAN は scripts/make_test_zip.py の実装そのもの
+      （TC-B-3 / TC-B-5 / TC-S-1 各モードのロジック詳細）に書き直し、
+      TEST は scripts/verify_test_zip.py の実装と実行方法に書き直した。
+
+  - date: "2026-05-20"
+    type: version_up
+    target:
+      file: spec
+      id: "production-operation-test-v2"
+      from: "1.0.0"
+      to: "2.0.0"
+    trigger: internal
+    reason: |
+      v1.0.0 SPEC は HDW_Notify の振る舞い要件（12 件）を REQ として記述し、
+      PLAN は各シナリオの実施手順（Slack 送付・スクショ保存・ログ抽出）を
+      タスク化していた。これは SDD 上で TEST に置くべき検証手順を PLAN に
+      混入させていた状態（形骸化アンチパターン「仕様がタスクリストになる」）。
+
+      v2.0.0 では SPEC を「本番運用試験の実施仕様」に再構成。
+      REQ は試験プロセスの要件（カタログ網羅・誘発操作の可逆性・
+      クライアント協調・観測物記録・AC 判定記録）の 5 件に整理し、
+      12 シナリオの詳細は docs/operations/test-scenarios.md として
+      PLAN の成物に移譲した。PLAN は最小限のインフラ成物
+      （Slack テンプレ 3 種・review テンプレ・scripts/ops 3 種・カタログ）に
+      限定し、TEST は SPEC の各 AC に対する具体的な検証手段に絞った。

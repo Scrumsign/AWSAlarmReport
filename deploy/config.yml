@@ -1,0 +1,35 @@
+# 本番 (AWS Lambda) 用 config。
+# シークレットは含めない（Webhook URL / ExternalId は GHA Secret 経由で Lambda 環境変数へ）。
+# Insights クエリやプロンプト等のアプリ内部ロジックも含めない。
+# AlarmName → ロググループ のマップは config/alarm_log_groups.yml に分離 (Lambda
+# Docker image に同梱され、起動時に PyYAML で直接読まれる。env var 経由ではない)。
+#
+# cross-account-architecture v1.0.0 以降の本番デプロイ先は
+# 自社アカウント hdw-test (088898720463) / ap-northeast-1。
+# 監視対象 HDW_ML は引き続きクライアントアカウント hanshin (920373030024) に存在し、
+# AssumeRole 経由でログを取得する。
+#
+# このファイルの値はデプロイ時に Lambda 環境変数へ投入される
+# （.github/workflows/deploy.yml 参照）。
+
+# 環境識別 (Discord Embed title prefix / 監視対象 Lambda)
+environment_name: prod
+target_function_name: HDW_Backend_Processor_0001
+
+# クロスアカウント (cross-account-architecture)
+# AssumeRole 先 (クライアントアカウント側で作成する IAM Role の ARN)
+aws_cross_account_role_arn: arn:aws:iam::920373030024:role/HDWNotifyLogReader
+
+# CloudWatch Logs Insights の完了ポーリング間隔。
+# (時間窓は src/main.py の定数 SHIP_LOG_WINDOW_MIN=330 (5h30m) で固定。
+#  alarm 発火は期待処理から ~5h 遅れて起きるドメイン特性のため動的調整不要。)
+aws_cloudwatch_logs_query_poll_interval_sec: 1.0
+
+# Bedrock（本番は出力安定性を優先）
+aws_bedrock_model_id: jp.anthropic.claude-opus-4-7
+aws_bedrock_max_tokens: 1024
+aws_bedrock_temperature: 0.2
+
+# Python ランタイム
+# Lambda 実行環境で stdout / stderr を UTF-8 強制 (em-dash や日本語の防御)。
+python_io_encoding: utf-8

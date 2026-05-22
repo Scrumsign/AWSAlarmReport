@@ -1,0 +1,166 @@
+plan:
+  spec:
+    id: "test-zip-management"
+    version: "2.0.0"
+  rev: 3
+  created_at: "2026-05-20"
+
+  tasks:
+    - id: "TASK-001"
+      req: "REQ-001"
+      title: "ベース ZIP 保管領域の整備"
+      description: |
+        ローカル作業ディレクトリを準備する:
+
+        1. mkdir -p tmp/test-zips/base
+        2. .gitignore に "tmp/" が記載されているか確認。無ければ追記:
+             echo "tmp/" >> .gitignore
+        3. クライアントから受領したベース ZIP は tmp/test-zips/base/ に
+           受領時のファイル名のまま配置する（例: sakura-20260427120100.zip）。
+
+    - id: "TASK-002"
+      req: "REQ-002, REQ-003, REQ-004"
+      title: "scripts/make_test_zip.py の基本構造実装"
+      description: |
+        scripts/make_test_zip.py を新規作成する。
+        CLI 仕様:
+          python scripts/make_test_zip.py <TC-ID> <input-zip> -o <output-zip>
+
+          <TC-ID>      : TC-B-3 / TC-B-5 / TC-S-1 のいずれか
+          <input-zip>  : ベース ZIP のパス（tmp/test-zips/base/*.zip）
+          -o <output>  : 出力 ZIP のパス（tmp/test-zips/<TC-ID>/...）
+
+        実装構造:
+          - argparse で TC-ID, input, -o/--output を受け取る
+          - 出力ディレクトリが存在しなければ Path.parent.mkdir(parents=True, exist_ok=True)
+          - TC-ID に応じて dispatch:
+              "TC-B-3" → tcb3_transform(zin, zout)
+              "TC-B-5" → tcb5_transform(zin, zout)
+              "TC-S-1" → tcs1_transform(zin, zout)
+              その他   → SystemExit(2) with エラーメッセージ
+          - zipfile.ZipFile を with でオープン
+            in: mode="r", out: mode="w", compression=zipfile.ZIP_DEFLATED
+          - 各 transform 関数は ZipInfo（filename, date_time, compress_type,
+            external_attr 等）を保持しつつエントリを書き出す。
+            バイト列の保持が要件なので
+            zin.read(info) → zout.writestr(new_info, data) パターンを使用
+
+        共通ヘルパー:
+          def copy_entry(zin, zout, info, new_filename=None, new_data=None):
+              """エントリを zin から zout へコピー。filename / data を上書き可能。"""
+              data = new_data if new_data is not None else zin.read(info.filename)
+              new_info = zipfile.ZipInfo(
+                  filename=new_filename or info.filename,
+                  date_time=info.date_time,
+              )
+              new_info.compress_type = info.compress_type
+              new_info.external_attr = info.external_attr
+              zout.writestr(new_info, data)
+
+    - id: "TASK-003"
+      req: "REQ-002"
+      title: "TC-B-3 モード実装（tampered/ プレフィックス付加）"
+      description: |
+        scripts/make_test_zip.py に tcb3_transform(zin, zout) 関数を実装する。
+
+        ロジック:
+          - zin.infolist() でベース ZIP の全エントリを順次処理
+          - 各エントリについて、filename を "tampered/" + original_filename に書き換える
+          - データ・date_time・compress_type・external_attr はベースから保持
+          - copy_entry(zin, zout, info, new_filename=f"tampered/{info.filename}") を呼ぶ
+
+        エッジケース:
+          - ディレクトリエントリ（filename が "/" で終わる）も同様に処理する
+          - ベース ZIP に既に "tampered/" で始まるエントリがあった場合は
+            二重プレフィックスになるが、想定外なので警告を stderr に出力して継続する
+
+    - id: "TASK-004"
+      req: "REQ-003"
+      title: "TC-B-5 モード実装（CSV 2 行目 1 列目を BROKEN に置換）"
+      description: |
+        scripts/make_test_zip.py に tcb5_transform(zin, zout) 関数を実装する。
+
+        前提ヘルパー: _real_filename(info)
+          zipfile が返した filename を実際の日本語に復元する。
+          - base ZIP (UTF-8 フラグなし): filename は cp437 で decode された
+            mojibake str → cp437→cp932 ラウンドトリップで真の日本語に戻る
+          - 生成 ZIP (UTF-8 フラグあり): zipfile が mojibake str を UTF-8 で
+            書き込むため読み戻しても mojibake str → 同じくラウンドトリップが効く
+          - 真の UTF-8 ZIP (例: 7-Zip): filename は既に正しい日本語 str →
+            cp437 encode で UnicodeEncodeError → 原文 fallback
+          UTF-8 フラグの有無に依存しない実装で 3 ケース一律対応:
+              def _real_filename(info):
+                  try:
+                      return info.filename.encode("cp437").decode("cp932")
+                  except (UnicodeEncodeError, UnicodeDecodeError):
+                      return info.filename
+
+        対象エントリ探索:
+          import re
+          PAT = re.compile(
+              r'(^|.*?/)db02/\d{4}/[^/]+/(定時|任意)/\d{14}/(?!General)[^/]+\.csv$'
+          )
+          target_info = None
+          for info in zin.infolist():
+              if PAT.match(_real_filename(info)):
+                  target_info = info
+                  break
+          if target_info is None:
+              raise SystemExit("対象 CSV（db02 配下の sensor CSV）が見つかりません")
+
+        ロジック:
+          - 全エントリを順次コピー（target_info 以外は copy_entry(zin, zout, info)）
+          - target_info に一致したエントリのみ、データを次のように加工:
+              raw = zin.read(info.filename)
+              text = raw.decode("cp932", errors="replace")
+              lines = text.splitlines(keepends=True)
+              if len(lines) < 2:
+                  raise SystemExit(f"対象 CSV の行数が不足: {_real_filename(info)}")
+              row2 = lines[1]
+              # 元の改行コードを保持。最終行が改行で終わらないケースも考慮:
+              eol = (
+                  "\r\n" if row2.endswith("\r\n")
+                  else ("\n" if row2.endswith("\n") else "")
+              )
+              cells = row2.rstrip("\r\n").split(",")
+              cells[0] = "BROKEN"
+              lines[1] = ",".join(cells) + eol
+              new_data = "".join(lines).encode("cp932", errors="replace")
+              copy_entry(zin, zout, info, new_data=new_data)
+
+        エンコーディングは cp932 固定（船側センサ装置の CSV 出力に合わせる）。
+
+    - id: "TASK-005"
+      req: "REQ-004"
+      title: "TC-S-1 モード実装（バイト列無改造コピー）"
+      description: |
+        scripts/make_test_zip.py に tcs1_transform(zin, zout) 関数を実装する。
+
+        ロジック:
+          - 全エントリを copy_entry(zin, zout, info) でそのままコピー
+          - 一切の加工を行わない（filename / data / metadata すべてを保持）
+
+        出力ファイル名は呼び出し側（CLI -o 引数）で
+        shimakaji-<timestamp>.zip を指定する責務とする。
+        本関数自体はファイル名変換に関与しない。
+
+    - id: "TASK-006"
+      req: "REQ-002, REQ-003, REQ-004"
+      title: "make_test_zip.py の手動動作確認"
+      description: |
+        実装完了後、ベース ZIP を 1 件用意して以下を実行し、エラーなく ZIP が
+        生成されることを目視確認する（詳細な検証は TEST 側で実施）:
+
+          BASE=tmp/test-zips/base/<base>.zip
+          SHIP=<ship>
+          TS=$(date +%Y%m%d%H%M%S)
+
+          python scripts/make_test_zip.py TC-B-3 $BASE \
+            -o tmp/test-zips/TC-B-3/${SHIP}-${TS}.zip
+          python scripts/make_test_zip.py TC-B-5 $BASE \
+            -o tmp/test-zips/TC-B-5/${SHIP}-${TS}.zip
+          python scripts/make_test_zip.py TC-S-1 $BASE \
+            -o tmp/test-zips/TC-S-1/shimakaji-${TS}.zip
+
+        各コマンドの終了コードが 0 であること、出力ファイルが存在することを
+        ls で確認。

@@ -1,0 +1,10 @@
+{
+  "alarmArn": "arn:aws:cloudwatch:ap-northeast-1:000000000000:alarm:hdw-backend-processor-0001-errors",
+  "alarmData": {
+    "state": {
+      "value": "ALARM",
+      "timestamp": "2026-04-27T12:05:00.000+0000",
+      "reason": "Threshold Crossed: 1 datapoint [1.0] was greater than or equal to the threshold (1.0)."
+    }
+  }
+}

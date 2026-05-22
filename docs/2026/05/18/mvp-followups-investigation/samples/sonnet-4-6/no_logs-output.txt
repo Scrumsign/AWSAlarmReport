@@ -1,0 +1,16 @@
+```json
+{
+  "summary": "[未起動] 直近時間窓内にエラー・成功ログ共に0件、Lambda未起動の疑い",
+  "severity": "MEDIUM",
+  "confidence": "medium",
+  "root_cause_hypothesis": "①上流の船側送信または転送処理が失敗・遅延しS3へのZIPアップロード自体が未着（最有力）。②ネットワーク障害によりアップロードが到達しなかった。③S3イベント通知設定の破損でLambdaがトリガーされなかった。④CloudWatch Logsの配信遅延で実際は処理済みだがログ未着の可能性も残る。",
+  "suggested_actions": [
+    "即時対応: S3バケットのinputFiles/プレフィックス配下に直近4時間以内のZIPオブジェクトが存在するかコンソールまたはCLIで確認する",
+    "調査手順: CloudTrailでS3 PutObjectイベント（inputFiles/*.zip）の有無を確認し、上流処理の成否およびLambdaトリガー発火履歴をLambdaメトリクス(Invocations)と突合する",
+    "恒久対策: S3アップロード未着を早期検知するため、ZIPが一定時間到着しない場合にアラートを発火するCloudWatch MetricFilterまたはEventBridgeルールを追加する"
+  ]
+}
+```
+
+=== usage ===
+{"inputTokens": 1878, "outputTokens": 427, "totalTokens": 2305, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}

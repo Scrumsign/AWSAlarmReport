@@ -1,0 +1,16 @@
+```json
+{
+  "summary": "[未起動] 直近窓で error/success ログなし。S3 アップロード未着が最有力",
+  "severity": "HIGH",
+  "confidence": "high",
+  "root_cause_hypothesis": "最有力: S3 バケットへの ZIP アップロード自体が発生しておらず Lambda がトリガーされていない。上流の船側送信処理・別 Lambda・手動転送のいずれかで失敗/遅延している可能性。副次: Lambda が cold start で powertools logger 初期化前にクラッシュしログが出力されず、かつ例外も記録されないケース。または CloudWatch Logs の配信遅延で実処理は進んだがログだけ未着。",
+  "suggested_actions": [
+    "S3 バケット inputFiles/ に直近 2 時間の ship_name-*.zip 着信を CloudTrail/S3 Access Logs で確認し、アップロード有無判定",
+    "Lambda の CloudTrail イベント (Invoke) と Metric (Invocations) を同時間窓で確認。ログなしが本当か、ログ配信遅延か切り分け",
+    "S3 イベント通知設定 (Lambda トリガー設定) が有効か、フィルタ rule が正しく inputFiles/*.zip をキャッチしているか確認"
+  ]
+}
+```
+
+=== usage ===
+{"inputTokens": 1878, "outputTokens": 394, "totalTokens": 2272, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}

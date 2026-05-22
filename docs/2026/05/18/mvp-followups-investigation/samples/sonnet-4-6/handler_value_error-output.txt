@@ -1,0 +1,16 @@
+```json
+{
+  "summary": "[処理失敗] sakura-20260427120100.zip を3回リトライするも main.py:62 で毎回 ValueError",
+  "severity": "HIGH",
+  "confidence": "high",
+  "root_cause_hypothesis": "①(b2)入力データ異常が最有力: ZIPを正常展開後も general_data が None のまま main.py:62 に到達しており、今回の sakura-20260427120100.zip に必須データファイルが欠落/空の可能性。②(b1)コードバグも並行候補: general_data を生成するロジック(main.py:62 手前)が特定条件下で None を返すバグ。「NG file」多発と「定時」ログがデータ不備を示唆。3回全試行で同一トレース=一過性障害ではない。",
+  "suggested_actions": [
+    "即時対応: Lambda の自動リトライを停止し、sakura-20260427120100.zip の S3 オブジェクトを手動でダウンロードして中身と必須ファイル有無を確認する",
+    "調査手順: main.py:62 直前で general_data を生成している処理(NG file判定ロジック含む)にデバッグログを追加し、どのファイルが NG と判定されて general_data が None になるかを特定する",
+    "恒久対策: main.py:62 の `raise ValueError` 前に general_data=None となった原因ファイル名・パスをログ出力する処理を追加し、再発時の原因切り分けを即時可能にする"
+  ]
+}
+```
+
+=== usage ===
+{"inputTokens": 7441, "outputTokens": 477, "totalTokens": 7918, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}

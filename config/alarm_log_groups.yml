@@ -1,0 +1,24 @@
+# Per-ship CloudWatch Alarm → 取得対象 CloudWatch Logs ロググループ のマップ。
+#
+# Lambda は起動時に本ファイルを読み込み、SNS event の AlarmName をキーとして
+# 対応するロググループを解決する。命名規約は alarm-naming-convention@1.0.0 に
+# 従う (hdw-<ship-name> 本番 / hdw-<ship-name>-test テスト)。
+#
+# 値は list (将来 1 alarm で複数 log group を見たい場合のため)。
+# 現状の Lambda 実装は list の先頭 1 件のみをクエリ対象として使う。
+#
+# Lambda Docker image には config/ ディレクトリごと同梱され、
+# /var/task/config/alarm_log_groups.yml として配備される。
+# 値変更時はコード再ビルド + Lambda 再デプロイが必要 (env var 経由ではない)。
+
+hdw-sakura:
+  - /aws/lambda/HDW_Backend_Processor_0001
+
+hdw-sakura-test:
+  - /aws/lambda/HDW_Backend_Processor_0001
+
+# 将来船舶追加例 (本番 + テスト の組で増設する想定):
+# hdw-shimakaji:
+#   - /aws/lambda/HDW_Backend_Processor_0001
+# hdw-shimakaji-test:
+#   - /aws/lambda/HDW_Backend_Processor_0001

@@ -1,0 +1,12 @@
+**
+!requirements.txt
+!src/**
+!config/**
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+.env
+.venv/
+docs/

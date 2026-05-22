@@ -1,0 +1,14 @@
+{
+  "summary": "[処理失敗] sakura-20260427120100.zip でValueError: general_data is None 3回再試行全失敗",
+  "severity": "HIGH",
+  "confidence": "high",
+  "root_cause_hypothesis": "main.py:62 にて `general_data` が None と判定され ValueError 発生。仮説優先順: (b2) sakura-20260427120100.zip 内に general_data 該当ファイル/キー欠落、(b1) main_function 内のデータ抽出ロジック不備で None 化、(b4) S3 download 一部失敗で general_data 未取得。",
+  "suggested_actions": [
+    "即時: sakura-20260427120100.zip の中身を S3 から取得し general_data 該当ファイル有無を確認",
+    "調査: main.py:62 直前で general_data 生成箇所と入力 NG file 多発(計15件)の関連を確認",
+    "恒久: main.py:62 で None 時に欠落キー名/原因ファイルをログ出力し、特定 ZIP 隔離処理を追加"
+  ]
+}
+
+=== usage ===
+{"inputTokens": 8210, "outputTokens": 373, "totalTokens": 8583, "cacheReadInputTokens": 0}

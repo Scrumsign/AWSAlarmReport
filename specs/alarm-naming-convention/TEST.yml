@@ -1,0 +1,141 @@
+test:
+  spec:
+    id: "alarm-naming-convention"
+    version: "1.0.0"
+  plan_rev: 1
+  rev: 1
+  created_at: "2026-05-21"
+
+  cases:
+    - id: "TC-001-1"
+      ac: "AC-001-1"
+      title: "本番 per-ship Alarm の AlarmName 正規表現マッチ"
+      description: |
+        本番アカウント (920373030024 / ap-northeast-1) 上の per-ship 本番 Alarm の
+        AlarmName が ``^hdw-[a-z][a-z0-9]*$`` にマッチすることを確認する。
+
+        確認手順 (PowerShell):
+          $names = aws cloudwatch describe-alarms `
+            --profile hanshin-t.kimura --region ap-northeast-1 `
+            --no-cli-pager `
+            --query "MetricAlarms[?starts_with(AlarmName, 'hdw-') && !ends_with(AlarmName, '-test')].AlarmName" `
+            | ConvertFrom-Json
+          $names | ForEach-Object { $_ -match '^hdw-[a-z][a-z0-9]*$' }
+
+        合格条件:
+          - 上記 query が返した名前 (本仕様策定時点ではゼロ件、将来作成される
+            本番 per-ship Alarm 全件) が、すべて正規表現にマッチする
+            (`-match` 結果が True のみ)。
+          - 該当ゼロ件のときは空集合上のマッチとして自動 PASS。
+
+    - id: "TC-001-2"
+      ac: "AC-001-2"
+      title: "テスト per-ship Alarm の AlarmName 正規表現マッチ"
+      description: |
+        本番アカウント上のテスト per-ship Alarm の AlarmName が
+        ``^hdw-[a-z][a-z0-9]*-test$`` にマッチすることを確認する。
+
+        確認コマンド:
+          aws cloudwatch describe-alarms \
+            --profile hanshin-t.kimura --region ap-northeast-1 \
+            --no-cli-pager \
+            --query "MetricAlarms[?starts_with(AlarmName, 'hdw-') && ends_with(AlarmName, '-test')].AlarmName"
+
+        合格条件:
+          - 返却された名前すべてが ``^hdw-[a-z][a-z0-9]*-test$`` にマッチする。
+          - 本仕様策定直後の時点では結果に少なくとも ``hdw-sakura-test`` が含まれる。
+
+    - id: "TC-001-3"
+      ac: "AC-001-3"
+      title: "本番 Alarm とテスト Alarm の共存確認"
+      description: |
+        将来 ``hdw-sakura`` (本番) を作成した時点で、既存の ``hdw-sakura-test`` と
+        干渉せず両者が同時に存在できることを確認する。
+
+        手順:
+          1. ``aws cloudwatch describe-alarms --alarm-names hdw-sakura hdw-sakura-test
+             --profile hanshin-t.kimura --region ap-northeast-1`` を実行。
+          2. 結果の MetricAlarms に両方の AlarmName が含まれることを確認。
+          3. 一方の set-alarm-state ALARM 操作が他方の StateValue を変えないことを
+             確認 (片方の状態遷移が独立しているか)。
+
+        合格条件:
+          - 手順 2 で 2 件返る。
+          - 手順 3 でいずれの操作も対象 Alarm のみが状態遷移する。
+
+        備考:
+          本 TC は本番 per-ship Alarm が初めて作られたタイミングで実施する。
+          本仕様策定時点では本番 per-ship Alarm が未作成のため PEND する。
+
+    - id: "TC-002-1"
+      ac: "AC-002-1"
+      title: "旧名 TestAlarm が削除されていることの確認"
+      description: |
+        本番アカウントに旧名 TestAlarm が存在しないことを確認する。
+
+        確認コマンド:
+          aws cloudwatch describe-alarms --alarm-names TestAlarm \
+            --profile hanshin-t.kimura --region ap-northeast-1 \
+            --no-cli-pager --query "MetricAlarms"
+
+        合格条件:
+          - 返却された MetricAlarms が空配列 ``[]``。
+
+    - id: "TC-002-2"
+      ac: "AC-002-2"
+      title: "hdw-sakura-test の Dimensions 検証"
+      description: |
+        本番アカウントに hdw-sakura-test が存在し、Dimensions が
+        FunctionName=TestFunction-DoesNotExist と ship_name=sakura の 2 件で
+        構成されていることを確認する。
+
+        確認コマンド:
+          aws cloudwatch describe-alarms --alarm-names hdw-sakura-test \
+            --profile hanshin-t.kimura --region ap-northeast-1 \
+            --no-cli-pager --query "MetricAlarms[0].Dimensions"
+
+        合格条件:
+          - 結果の配列に以下 2 件が (順序不問で) 含まれる:
+            - {Name: FunctionName, Value: TestFunction-DoesNotExist}
+            - {Name: ship_name, Value: sakura}
+          - 上記以外の Dimension が含まれない (配列長 = 2)。
+
+    - id: "TC-002-3"
+      ac: "AC-002-3"
+      title: "hdw-sakura-test の AlarmActions 検証"
+      description: |
+        hdw-sakura-test の AlarmActions に hdw-ml-alarm-topic SNS ARN が
+        含まれることを確認する。
+
+        確認コマンド:
+          aws cloudwatch describe-alarms --alarm-names hdw-sakura-test \
+            --profile hanshin-t.kimura --region ap-northeast-1 \
+            --no-cli-pager --query "MetricAlarms[0].AlarmActions"
+
+        合格条件:
+          - 結果配列に
+            ``arn:aws:sns:ap-northeast-1:920373030024:hdw-ml-alarm-topic``
+            が含まれる。
+
+    - id: "TC-002-4"
+      ac: "AC-002-4"
+      title: "hdw-sakura-test のメトリクス構成検証"
+      description: |
+        hdw-sakura-test の Metric / Threshold / Period 等の構成が TestAlarm 由来の
+        値を維持していることを確認する。
+
+        確認コマンド:
+          aws cloudwatch describe-alarms --alarm-names hdw-sakura-test \
+            --profile hanshin-t.kimura --region ap-northeast-1 \
+            --no-cli-pager \
+            --query "MetricAlarms[0].{Metric:MetricName,Namespace:Namespace,Statistic:Statistic,Period:Period,EvaluationPeriods:EvaluationPeriods,Threshold:Threshold,Op:ComparisonOperator,Missing:TreatMissingData}"
+
+        合格条件 (すべて以下と一致):
+          - MetricName    = "Errors"
+          - Namespace     = "AWS/Lambda"
+          - Statistic     = "Sum"
+          - Period        = 300
+          - EvaluationPeriods = 1
+          - Threshold     = 1.0
+          - ComparisonOperator = "GreaterThanOrEqualToThreshold"
+          - TreatMissingData = "notBreaching"
