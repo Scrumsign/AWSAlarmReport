@@ -46,7 +46,18 @@ def _load_email_config() -> list[dict]:
 
 
 class SESEmailChannel(Channel):
+    """Amazon SES を使ってアラーム通知メールを送信するチャネル実装。
+
+    email.yaml で定義したグループ ID に対応する宛先リストを初期化時に解決し、
+    HTML + プレーンテキストのマルチパートメールを SES で送信する。
+    送信元アドレスは環境変数 SES_FROM_ADDRESS から取得する。
+    """
+
     def __init__(self, group_id: str) -> None:
+        """
+        Args:
+            group_id: email.yaml で定義した宛先グループの ID（例: ``"scrumsign"``）。
+        """
         self._group_id = group_id
         entries = _load_email_config()
         self._addresses = resolve_addresses(group_id, entries)
@@ -56,6 +67,11 @@ class SESEmailChannel(Channel):
         return f"email.{self._group_id}"
 
     def send(self, message: Message) -> None:
+        """Message を HTML / プレーンテキストのマルチパートメールで送信する。
+
+        宛先アドレスが空の場合は WARNING を出力してスキップする。
+        送信元は環境変数 SES_FROM_ADDRESS で指定する。
+        """
         if not self._addresses:
             logger.warning(
                 "no email addresses for group, skipping",
@@ -75,6 +91,7 @@ class SESEmailChannel(Channel):
         )
 
     def _to_html(self, message: Message) -> str:
+        """Message を HTML メール本文に変換して返す。タイムスタンプは JST に変換する。"""
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
         actions_html = "".join(f"<li>{a}</li>" for a in message.actions)
         return (
@@ -86,6 +103,7 @@ class SESEmailChannel(Channel):
         )
 
     def _to_plain(self, message: Message) -> str:
+        """Message をプレーンテキストのメール本文に変換して返す。タイムスタンプは JST に変換する。"""
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
         actions = "\n".join(f"- {a}" for a in message.actions)
         return (

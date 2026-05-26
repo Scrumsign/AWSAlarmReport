@@ -96,12 +96,25 @@ def _post_minimal_embed(
 
 
 class DiscordChannel(Channel):
+    """Discord Webhook を使ってアラーム通知を投稿するチャネル実装。
+
+    DiscordEmbed を用いて severity に応じた色付き埋め込みを送信する。
+    Discord 固有の UI（author、フィールドレイアウト、タイムスタンプ）は
+    このクラス内に閉じており、Message データ構造には依存しない。
+    """
+
     def __init__(
         self,
         webhook_url: str,
         environment_name: str,
         target_function_name: str,
     ) -> None:
+        """
+        Args:
+            webhook_url: Discord Webhook の URL（環境変数 DISCORD_WEBHOOK_URL）。
+            environment_name: embed の author 表示名に使う環境識別子。
+            target_function_name: 監視対象 Lambda 名。embed フィールドに表示する。
+        """
         self._webhook_url = webhook_url
         self._environment_name = environment_name
         self._target_function_name = target_function_name
@@ -111,6 +124,11 @@ class DiscordChannel(Channel):
         return "discord"
 
     def send(self, message: Message) -> None:
+        """Message を Discord Embed としてフォーマットし Webhook で投稿する。
+
+        severity が DISCORD_SEVERITY_COLOR に存在しない場合はグレー（0x95A5A6）を使う。
+        actions が空の場合は推奨アクションフィールドを省略する。
+        """
         webhook = DiscordWebhook(url=self._webhook_url)
         color = DISCORD_SEVERITY_COLOR.get(message.severity, 0x95A5A6)
         embed = DiscordEmbed(title=message.title[:256], color=color)

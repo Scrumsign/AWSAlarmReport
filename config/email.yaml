@@ -1,4 +1,11 @@
+# SES メール送信先グループ定義
+#
+# 構造:
+#   id  : グループ識別子。error-profiles.yml の channels で "email.<id>" として参照する。
+#   add : 送信先メールアドレスのリスト。
+
+# scrumsign: ScrumSign 社内アラート通知先。システム管理者・運用担当者。
 - id: scrumsign
   add:
-    - kitamura@scrumsign.com
-    - t.kimura@scrumsign.com
+    - kitamura@scrumsign.com  # システム管理者
+    - t.kimura@scrumsign.com  # 運用担当者

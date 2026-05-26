@@ -1,28 +1,45 @@
+# エラープロファイル定義
+#
+# _resolve_error_id() が返す error_id ごとに通知チャネルと説明文を定義する。
+#
+# 構造:
+#   id          : エラー種別 ID。_resolve_error_id() の戻り値と一致させる。
+#   channels    : 通知先チャネルのリスト。"discord" または "email.<group_id>" を指定する。
+#   description : Bedrock のシステムプロンプトに注入するエラー概要。日本語で記述する。
+
+# s3_data_missing: S3 へのファイル到着がなく Lambda が未起動のケース。
+#   ログが存在しないため LLM はアップロード側の問題として分析する。
 - id: s3_data_missing
   channels:
-    - discord
+    - discord  # 社内オペレーションチャンネルへ即時通知
   description: |
     S3へのデータ不着を検知しました。対象Lambdaの実行ログが存在しないため、Lambda自体が起動していません。
     原因として、クライアント側のアップロード失敗またはイベントトリガー設定の不備が考えられます。
 
+# lambda_failure: Lambda は起動したが status=error のログが記録されたケース。
+#   ログを LLM に渡して根本原因を特定させる通常の解析フロー。
 - id: lambda_failure
   channels:
-    - discord
+    - discord  # 社内オペレーションチャンネルへ即時通知
   description: |
     対象Lambdaが起動しましたが、処理中にエラーが発生しました。
     CloudWatch Logsにstatus=errorのログが記録されています。
     原因として、入力データの形式不正、依存サービスのタイムアウト、またはコードのバグが考えられます。
 
+# unknown: Lambda は起動しログも存在するが、エラーログが見当たらないケース。
+#   正常終了しているにもかかわらずアラームが発火した可能性がある。手動調査が必要。
 - id: unknown
   channels:
-    - discord
+    - discord  # 社内オペレーションチャンネルへ即時通知
   description: |
     エラー種別を特定できませんでした。Lambdaの実行ログは存在しますが、エラーログが含まれていません。
     手動での調査が必要です。
 
+# unknown_alarm: アラーム名が命名規約に合致せず ship_name を抽出できないケース。
+#   このシステムが処理対象外のアラームが誤って通知された可能性がある。
 - id: unknown_alarm
   channels:
-    - discord
+    - discord  # 社内オペレーションチャンネルへ即時通知
   description: |
     想定外のアラーム名を受信しました。このシステムが処理対象としていないアラームが発火した可能性があります。
     アラーム設定・命名規則を確認してください。

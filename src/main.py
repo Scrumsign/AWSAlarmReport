@@ -175,6 +175,18 @@ def _resolve_error_id(alarm_name: str, log_rows: list) -> str:
 def _build_channel_registry(
     channel_ids: list[str], env: "Env"
 ) -> "dict[str, Any]":
+    """channel_ids リストに基づいて Channel インスタンスの辞書を構築して返す。
+
+    discord は常に登録される。``email.<group_id>`` 形式の ID が含まれる場合のみ
+    対応する SESEmailChannel を生成する。知らない ID は無視する（警告は _dispatch 側）。
+
+    Args:
+        channel_ids: error-profiles.yml から取得したチャネル ID リスト。
+        env: Lambda 実行環境設定（Webhook URL 等を含む）。
+
+    Returns:
+        channel_id をキー、Channel インスタンスを値とする辞書。
+    """
     registry: dict[str, Any] = {
         "discord": DiscordChannel(
             webhook_url=env.discord_webhook_url,
@@ -190,6 +202,18 @@ def _build_channel_registry(
 
 
 def _dispatch(alarm_name: str, message: Message, error_id: str, env: "Env") -> None:
+    """error_id に対応する全チャネルへ Message を送信する。
+
+    error-profiles.yml から対象チャネル ID を解決し、各 Channel.send() を呼ぶ。
+    個々のチャネル送信が失敗しても WARNING を出力して継続し、他チャネルへの
+    送信をブロックしない。
+
+    Args:
+        alarm_name: CloudWatch アラーム名（ログ出力用）。
+        message: 送信するメッセージオブジェクト。
+        error_id: _resolve_error_id で決定したエラー種別 ID。
+        env: Lambda 実行環境設定。
+    """
     profiles = _load_error_profiles()
     channel_ids = _resolve_channel_ids(error_id, profiles)
     registry = _build_channel_registry(channel_ids, env)
