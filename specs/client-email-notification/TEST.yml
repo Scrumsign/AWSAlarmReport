@@ -1,0 +1,111 @@
+id: client-email-notification
+spec_version: 0.3.0
+task_rev: 2
+rev: 2
+test_cases:
+  - id: TC-001
+    task: TASK-001
+    req: REQ-002
+    type: static
+    title: Message dataclass と Channel 基底クラス
+    checks:
+      - mypy src/channels/message.py がエラーなしで通過する
+      - mypy src/channels/base.py がエラーなしで通過する
+      - Message インスタンスの属性変更が FrozenInstanceError を送出する
+
+  - id: TC-002
+    task: TASK-002
+    req: REQ-002
+    type: unit
+    title: DiscordChannel の embed 構築と送信
+    checks:
+      - DiscordWebhook.execute が呼ばれる
+      - severity ごとに embed の color が設定される
+      - embed.title に message.title が含まれる
+      - embed.footer に message.alarm_name が含まれる
+      - main.py に DiscordWebhook の直接呼び出しが存在しない
+
+  - id: TC-003
+    task: TASK-003
+    req: REQ-005
+    type: unit
+    title: error-routing.yml の読み込みとフォールバック
+    checks:
+      - _load_error_routing() が {error_id:entry} 辞書を返す
+      - _resolve_channel_ids("s3_data_missing") が ["discord", "email"] を返す
+      - _resolve_channel_ids("unknown_error") が ["discord"] を返し WARNING が出る
+
+  - id: TC-004
+    task: TASK-004
+    req: REQ-006
+    type: unit
+    title: resolve_addresses の境界条件
+    checks:
+      - group_id に対応するアドレスリストが返る
+      - email.dev → dev キーのアドレスリストが使われる
+      - group_id 不在時に [] を返し WARNING が出る
+      - email.yaml が dict[str, list[str]] 形式でロードされる
+
+  - id: TC-005
+    task: TASK-005
+    req: [REQ-001, REQ-002]
+    type: unit
+    title: SESEmailChannel の SES API 呼び出し
+    checks:
+      - SESEmailChannel("dev").id が "email.dev" を返す
+      - boto3 send_email が呼ばれる
+      - ToAddresses が resolve_addresses の返り値と一致する
+      - group_id 不在時は send_email が呼ばれず WARNING が出る
+      - Source が SES_FROM_ADDRESS 環境変数の値と一致する
+
+  - id: TC-006
+    task: TASK-006
+    req: [REQ-003, REQ-004]
+    type: unit
+    title: HTML・プレーンテキストテンプレート
+    checks:
+      - send_email リクエストに Body.Html と Body.Text が含まれる
+      - _to_html() に ship_name が含まれる
+      - _to_html() に JST 形式タイムスタンプが含まれる
+      - _to_html() に severity が含まれる
+      - _to_html() に actions 全件が含まれる
+      - _to_plain() に同内容が含まれる
+
+  - id: TC-007
+    task: TASK-007
+    req: [REQ-002, REQ-005, REQ-007]
+    type: integration
+    title: _dispatch ルーティングアルゴリズム
+    checks:
+      - _build_channel_registry(["discord", "email.dev"]) が email.dev キーに SESEmailChannel を生成する
+      - 生成された SESEmailChannel の group_id が "dev" である
+      - _resolve_error_id("hdw-sakura") が "s3_data_missing" を返す
+      - _resolve_error_id("hdw-test-001") が "s3_data_missing" を返す
+      - _resolve_error_id("unknown-alarm") が "unknown" を返し WARNING が出る
+      - routing の channels に従って全チャネルに send が呼ばれる
+      - error_id routing 不在時に discord のみ送信し WARNING が出る
+      - 未知の channel_id はスキップし WARNING が出る
+      - SESEmailChannel 例外発生時も DiscordChannel.send が呼ばれる
+      - DiscordChannel 例外発生時も SESEmailChannel.send が呼ばれる
+      - 全 channel 例外発生時も _dispatch が正常終了する
+
+  - id: TC-008
+    task: TASK-008
+    req: REQ-001
+    type: e2e
+    title: IAM ポリシーと SES セットアップ
+    checks:
+      - Lambda 実行ロールに ses:SendEmail / ses:SendRawEmail が付与されている
+      - SES サンドボックスが解除されている
+      - scrumsign.com ドメインが SES で検証済み
+      - テストメールが実際に届く
+
+  - id: TC-009
+    task: TASK-009
+    req: [REQ-005, REQ-006]
+    type: static
+    title: Lambda コンテナイメージへの config ファイル包含
+    checks:
+      - /var/task/config/error-routing.yml が存在する
+      - /var/task/config/email.yaml が存在する
+      - 両ファイルが yaml.safe_load で正常に読み込める

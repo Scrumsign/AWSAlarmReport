@@ -1,0 +1,28 @@
+- id: s3_data_missing
+  channels:
+    - discord
+  description: |
+    S3へのデータ不着を検知しました。対象Lambdaの実行ログが存在しないため、Lambda自体が起動していません。
+    原因として、クライアント側のアップロード失敗またはイベントトリガー設定の不備が考えられます。
+
+- id: lambda_failure
+  channels:
+    - discord
+  description: |
+    対象Lambdaが起動しましたが、処理中にエラーが発生しました。
+    CloudWatch Logsにstatus=errorのログが記録されています。
+    原因として、入力データの形式不正、依存サービスのタイムアウト、またはコードのバグが考えられます。
+
+- id: unknown
+  channels:
+    - discord
+  description: |
+    エラー種別を特定できませんでした。Lambdaの実行ログは存在しますが、エラーログが含まれていません。
+    手動での調査が必要です。
+
+- id: unknown_alarm
+  channels:
+    - discord
+  description: |
+    想定外のアラーム名を受信しました。このシステムが処理対象としていないアラームが発火した可能性があります。
+    アラーム設定・命名規則を確認してください。

@@ -1,0 +1,1627 @@
+plan:
+  spec:
+    id: "bedrock-prompt-generalization"
+    version: "0.5.0"
+  rev: 5
+  created_at: "2026-05-22"
+
+  # NOTE: SPEC v0.5.0 で open_decisions のうち O-1 / O-2 / O-3 / O-7 / A-7 が
+  # 確定済。残る未確定は O-4 (failure_taxonomy override) / O-5 (同時発火粒度) /
+  # O-6 (命名スロット <CONTEXT_PREFIX> / <PROFILE_FILE>) のみ。
+  # O-6 の確定時に本 PLAN 内の変数表記を実名に一括置換する。
+  #
+  # 本 PLAN は各 TASK に具体的な Python コード断片を含める。実装着手時の
+  # ガイドとし、最終的なコードは TASK 完了時に検収する。
+  #
+  # 全 TASK 共通の前提:
+  #   - Python 3.12, AWS Lambda runtime (Docker image)
+  #   - aws-lambda-powertools の Logger を使う (Logger() インスタンスを
+  #     モジュールスコープに 1 個持つ)
+  #   - boto3 で AWS SDK アクセス
+  #   - 例外を握りつぶさず、明示クラスを定義する
+
+  # =============================================================================
+  # profile YAML 具体例集
+  # =============================================================================
+  # 本セクションは profile スキーマ (SPEC「profile スキーマ完全形」参照) に対する
+  # 具体的なインスタンス例を集める。実装時のリファレンス + TASK-011 のデプロイ対象。
+  #
+  # ─── 例 1: HDW_Backend_Processor_0001 (現行運用、最小構成) ───
+  #
+  # function_name: HDW_Backend_Processor_0001
+  #
+  # signal_kind:
+  #   # verdict 系
+  #   - name: completion_success
+  #     type: verdict
+  #     mechanism: log_marker
+  #     locator: 'event="lambda_complete" 行の status フィールド'
+  #     success_condition: 'status == "success" のレコードが 1 件以上存在'
+  #     failure_condition: 'status == "error"、または stack_trace/traceback が存在'
+  #     absence_hypothesis: 'S3 への ZIP アップロード自体が発生せず Lambda 未起動'
+  #     max_severity_on_success: MEDIUM
+  #     severity_on_absence: MEDIUM
+  #
+  #   # ignored 系
+  #   - name: ng_file
+  #     type: ignored
+  #     mechanism: log_marker
+  #     locator: 'message に "NG file" を含む行'
+  #     description: '設計上の許容分岐 — 障害根拠としない'
+  #
+  #   - name: pia_data_none
+  #     type: ignored
+  #     mechanism: log_marker
+  #     locator: 'message に "pia_data is None" を含む行'
+  #     description: '上流のデータ品質問題 — 障害根拠としない'
+  #
+  #   - name: csv_parse_failed
+  #     type: ignored
+  #     mechanism: log_marker
+  #     locator: 'message に "csv parse failed" を含む行'
+  #     description: '上流のデータ品質問題 — 障害根拠としない'
+  #
+  # signal:
+  #   - name: hdw-sakura
+  #     kind: completion_success
+  #
+  # input_identifiers: [ship_name, ship_timestamp, input_key]
+  #
+  # 対応する configs/hdw-sakura.yaml:
+  #   function_name: HDW_Backend_Processor_0001
+  #   account_id: "920373030024"
+  #   aws_region: ap-northeast-1
+  #   assume_role_arn: arn:aws:iam::920373030024:role/HDWNotifyLogReader
+  #   log_group: /aws/lambda/HDW_Backend_Processor_0001
+  #   profile_location: s3://<client-bucket>/<CONTEXT_PREFIX>/<PROFILE_FILE>
+  #   bedrock_model_id: <現行 BEDROCK_MODEL_ID env var の値>
+  #   bedrock_max_tokens: <現行 BEDROCK_MAX_TOKENS env var の値>
+  #   cloudwatch_logs_query_poll_interval_sec: 2.0
+  #
+  # ─── 例 2: 同一 Lambda に複数アラーム (将来拡張) ───
+  #
+  # function_name: HDW_Backend_Processor_0001
+  #
+  # signal_kind:
+  #   - name: completion_success
+  #     type: verdict
+  #     mechanism: log_marker
+  #     ... (例 1 と同じ)
+  #     max_severity_on_success: MEDIUM
+  #     severity_on_absence: MEDIUM
+  #
+  #   - name: latency
+  #     type: verdict
+  #     mechanism: metric
+  #     locator: 'CloudWatch メトリクス AWS/Lambda Duration の p99'
+  #     success_condition: 'p99 Duration <= 30000ms'
+  #     failure_condition: 'p99 Duration > 30000ms'
+  #     absence_hypothesis: 'メトリクスデータ無し — Lambda invocation 不在の可能性'
+  #     max_severity_on_success: LOW
+  #     severity_on_absence: MEDIUM
+  #
+  #   # ignored 系は例 1 と同じ
+  #
+  # signal:
+  #   - name: hdw-sakura
+  #     kind: completion_success
+  #   - name: hdw-duration-p99
+  #     kind: latency
+  #
+  # input_identifiers: [ship_name, ship_timestamp, input_key]
+  #
+  # ─── 例 3: 別クライアント (別運用 Lambda) ───
+  #
+  # function_name: BENGAL_Backend_Processor_0001
+  #
+  # signal_kind:
+  #   - name: ingestion_complete
+  #     type: verdict
+  #     mechanism: log_marker
+  #     locator: 'event="ingestion_done" 行の result フィールド'
+  #     success_condition: 'result == "ok"'
+  #     failure_condition: 'result == "ng"、または exception が存在'
+  #     absence_hypothesis: 'Kinesis stream 経由のトリガーが届いていない可能性'
+  #     max_severity_on_success: MEDIUM
+  #     severity_on_absence: HIGH
+  #
+  # signal:
+  #   - name: bengal-vessel-a
+  #     kind: ingestion_complete
+  #
+  # input_identifiers: [vessel_id, ingest_at, source_topic]
+  #
+  # ─── 例 4: スキーマ違反パターン (ProfileSchemaError で弾かれる) ───
+  #
+  # NG (signal[].name に "-test" 末尾):
+  #   signal:
+  #     - name: hdw-sakura-test    # ✗ 整合性制約 #3 違反
+  #       kind: completion_success
+  #
+  # NG (signal[].kind が ignored を指す):
+  #   signal:
+  #     - name: hdw-x
+  #       kind: ng_file            # ✗ 整合性制約 #5 違反
+  #
+  # NG (type=verdict で severity フィールド欠落):
+  #   signal_kind:
+  #     - name: completion_success
+  #       type: verdict
+  #       ...
+  #       # max_severity_on_success / severity_on_absence 欠落 ✗
+  #
+  # =============================================================================
+
+  tasks:
+
+    # ============================================================
+    # TASK-001: profile スキーマ検証関数の実装
+    # ============================================================
+    - id: "TASK-001"
+      req: "REQ-002"
+      title: "profile スキーマと検証関数を実装する"
+      description: |
+        src/utils/profile.py を新設し、以下を実装する:
+
+          - 例外クラス: ProfileSchemaError
+          - 定数 VALID_SIGNAL_TYPES = ("verdict", "ignored")
+          - 定数 VALID_MECHANISMS = ("log_marker", "metric", "structured_result")
+          - 定数 VALID_SEVERITIES = ("LOW", "MEDIUM", "HIGH")
+          - validate_profile(data: dict) -> None 関数
+
+        実装例:
+
+          ```python
+          # src/utils/profile.py
+          from __future__ import annotations
+          from typing import Any
+
+          VALID_SIGNAL_TYPES = ("verdict", "ignored")
+          VALID_MECHANISMS = ("log_marker", "metric", "structured_result")
+          VALID_SEVERITIES = ("LOW", "MEDIUM", "HIGH")
+
+
+          class ProfileSchemaError(Exception):
+              """Resource profile schema violation."""
+
+
+          def validate_profile(data: dict[str, Any]) -> None:
+              # 1. トップレベル必須フィールド
+              required_top = ["function_name", "signal_kind", "signal",
+                              "input_identifiers"]
+              for key in required_top:
+                  if key not in data:
+                      raise ProfileSchemaError(
+                          f"missing required top-level field: {key!r}"
+                      )
+
+              # 2. function_name
+              if not isinstance(data["function_name"], str) or not data["function_name"]:
+                  raise ProfileSchemaError("function_name must be a non-empty str")
+
+              # 3. signal_kind: list + 各エントリ検証
+              if not isinstance(data["signal_kind"], list) or not data["signal_kind"]:
+                  raise ProfileSchemaError(
+                      "signal_kind must be a non-empty list"
+                  )
+              kind_names: set[str] = set()
+              for i, kind in enumerate(data["signal_kind"]):
+                  _validate_signal_kind_entry(kind, i, kind_names)
+                  kind_names.add(kind["name"])
+
+              # 4. signal: list + 各エントリ検証 + 整合性
+              if not isinstance(data["signal"], list):
+                  raise ProfileSchemaError("signal must be a list")
+              signal_names: set[str] = set()
+              verdict_kind_names = {
+                  k["name"] for k in data["signal_kind"]
+                  if k["type"] == "verdict"
+              }
+              for i, s in enumerate(data["signal"]):
+                  if not isinstance(s, dict):
+                      raise ProfileSchemaError(f"signal[{i}] must be a dict")
+                  for f in ("name", "kind"):
+                      if f not in s:
+                          raise ProfileSchemaError(
+                              f"signal[{i}] missing field {f!r}"
+                          )
+                  if s["name"].endswith("-test"):
+                      raise ProfileSchemaError(
+                          f"signal[{i}].name={s['name']!r} ends with '-test'; "
+                          f"use normalized alarm name"
+                      )
+                  if s["name"] in signal_names:
+                      raise ProfileSchemaError(
+                          f"duplicate signal[].name: {s['name']!r}"
+                      )
+                  signal_names.add(s["name"])
+                  if s["kind"] not in kind_names:
+                      raise ProfileSchemaError(
+                          f"signal[{i}].kind={s['kind']!r} not in signal_kind"
+                      )
+                  if s["kind"] not in verdict_kind_names:
+                      raise ProfileSchemaError(
+                          f"signal[{i}].kind={s['kind']!r} is not type=verdict"
+                      )
+
+              # 5. input_identifiers
+              ids = data["input_identifiers"]
+              if not isinstance(ids, list) or not ids:
+                  raise ProfileSchemaError(
+                      "input_identifiers must be a non-empty list of str"
+                  )
+              for i, v in enumerate(ids):
+                  if not isinstance(v, str) or not v:
+                      raise ProfileSchemaError(
+                          f"input_identifiers[{i}] must be a non-empty str"
+                      )
+
+
+          def _validate_signal_kind_entry(
+              kind: Any, index: int, seen_names: set[str]
+          ) -> None:
+              if not isinstance(kind, dict):
+                  raise ProfileSchemaError(f"signal_kind[{index}] must be a dict")
+
+              # 共通必須
+              for f in ("name", "type", "mechanism", "locator"):
+                  if f not in kind:
+                      raise ProfileSchemaError(
+                          f"signal_kind[{index}] missing field {f!r}"
+                      )
+
+              name = kind["name"]
+              if not isinstance(name, str) or not name:
+                  raise ProfileSchemaError(
+                      f"signal_kind[{index}].name must be a non-empty str"
+                  )
+              if name in seen_names:
+                  raise ProfileSchemaError(
+                      f"duplicate signal_kind name: {name!r}"
+                  )
+
+              if kind["type"] not in VALID_SIGNAL_TYPES:
+                  raise ProfileSchemaError(
+                      f"signal_kind[{index}].type={kind['type']!r} "
+                      f"not in {VALID_SIGNAL_TYPES}"
+                  )
+              if kind["mechanism"] not in VALID_MECHANISMS:
+                  raise ProfileSchemaError(
+                      f"signal_kind[{index}].mechanism={kind['mechanism']!r} "
+                      f"not in {VALID_MECHANISMS}"
+                  )
+
+              # discriminated union
+              if kind["type"] == "verdict":
+                  for f in ("success_condition", "failure_condition",
+                            "absence_hypothesis",
+                            "max_severity_on_success", "severity_on_absence"):
+                      if f not in kind:
+                          raise ProfileSchemaError(
+                              f"signal_kind[{index}] (type=verdict) "
+                              f"missing field {f!r}"
+                          )
+                  for f in ("max_severity_on_success", "severity_on_absence"):
+                      if kind[f] not in VALID_SEVERITIES:
+                          raise ProfileSchemaError(
+                              f"signal_kind[{index}].{f}={kind[f]!r} "
+                              f"not in {VALID_SEVERITIES}"
+                          )
+
+              elif kind["type"] == "ignored":
+                  if "description" not in kind:
+                      raise ProfileSchemaError(
+                          f"signal_kind[{index}] (type=ignored) "
+                          f"missing field 'description'"
+                      )
+          ```
+
+        本検証関数は TASK-002 (profile 取得) の直後で呼ばれ、違反時は
+        ProfileSchemaError として main 側で REQ-008 (a) フォールバックに
+        分岐する。
+
+    # ============================================================
+    # TASK-002: profile 取得経路 (S3 GetObject + 検証)
+    # ============================================================
+    - id: "TASK-002"
+      req: "REQ-003, REQ-005"
+      title: "profile を S3 から取得し検証する関数を実装する"
+      description: |
+        src/utils/profile.py に以下を追加する:
+
+          ```python
+          import yaml
+          from botocore.exceptions import BotoCoreError, ClientError
+
+
+          def fetch_profile(
+              s3_client, profile_location: str
+          ) -> dict[str, Any]:
+              """profile_location (s3:// URI) から YAML を取得して dict を返す。
+
+              スキーマ検証は別途 validate_profile() で行う。
+              S3 取得失敗・YAML 構文エラー・スキーマ違反は ProfileSchemaError に
+              統一して投げる (main 側の REQ-008 (a) フォールバック判定簡略化)。
+              """
+              if not profile_location.startswith("s3://"):
+                  raise ProfileSchemaError(
+                      f"profile_location must start with s3://, got {profile_location!r}"
+                  )
+              # s3://<bucket>/<key> をパース
+              _, _, rest = profile_location.partition("s3://")
+              bucket, _, key = rest.partition("/")
+              if not bucket or not key:
+                  raise ProfileSchemaError(
+                      f"invalid s3 URI: {profile_location!r}"
+                  )
+
+              try:
+                  resp = s3_client.get_object(Bucket=bucket, Key=key)
+                  body = resp["Body"].read().decode("utf-8")
+              except (BotoCoreError, ClientError) as e:
+                  raise ProfileSchemaError(
+                      f"s3 get_object failed: {profile_location!r}: {e}"
+                  ) from e
+
+              try:
+                  data = yaml.safe_load(body) or {}
+              except yaml.YAMLError as e:
+                  raise ProfileSchemaError(
+                      f"yaml parse failed for {profile_location!r}: {e}"
+                  ) from e
+
+              if not isinstance(data, dict):
+                  raise ProfileSchemaError(
+                      f"profile root must be a mapping, got {type(data).__name__}"
+                  )
+
+              validate_profile(data)
+              return data
+          ```
+
+        IAM 変更 (運用 Lambda 側):
+          - cross-account-architecture の AssumeRole 対象 Role
+            (HDWNotifyLogReader 相当) の Permission Policy に追加:
+
+            ```json
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject"],
+              "Resource":
+                "arn:aws:s3:::<client-bucket>/<CONTEXT_PREFIX>/*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket"],
+              "Resource": "arn:aws:s3:::<client-bucket>",
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": "<CONTEXT_PREFIX>/*"
+                }
+              }
+            }
+            ```
+
+          - バケットが KMS CMK で暗号化されている場合、CMK 側に
+            cross-account kms:Decrypt grant を追加。
+
+    # ============================================================
+    # TASK-003: configs/ ディレクトリ移行
+    # ============================================================
+    - id: "TASK-003"
+      req: "REQ-004, REQ-013"
+      title: "configs/ ディレクトリを新設し既存設定を移行する"
+      description: |
+        作業手順:
+
+        (1) リポジトリに configs/ ディレクトリを新設。
+        (2) configs/hdw-sakura.yaml を作成 (HDW_Backend_Processor_0001 の
+            現行運用設定を移植):
+
+            ```yaml
+            # configs/hdw-sakura.yaml
+            function_name: HDW_Backend_Processor_0001
+            account_id: "920373030024"
+            aws_region: ap-northeast-1
+            assume_role_arn: arn:aws:iam::920373030024:role/HDWNotifyLogReader
+            log_group: /aws/lambda/HDW_Backend_Processor_0001
+            profile_location: s3://<client-bucket>/<CONTEXT_PREFIX>/<PROFILE_FILE>
+            bedrock_model_id: <現行 BEDROCK_MODEL_ID env var の値を移植>
+            bedrock_max_tokens: <現行 BEDROCK_MAX_TOKENS env var の値を移植>
+            cloudwatch_logs_query_poll_interval_sec: 2.0
+            ```
+
+        (3) Dockerfile を更新し configs/ を image にコピー:
+
+            ```dockerfile
+            # Dockerfile (差分)
+            COPY configs/ /var/task/configs/
+            ```
+
+        (4) 既存の config/alarm_log_groups.yml および src/main.py の
+            _load_alarm_log_groups() / _ALARM_LOG_GROUPS / 関連参照を削除。
+        (5) cross-account-architecture REQ-004 の LOG_GROUP_MAP env var
+            関連の処理も削除 (configs/*.yaml に統合される)。
+
+    # ============================================================
+    # TASK-004: load_config() と Config dataclass の実装
+    # ============================================================
+    - id: "TASK-004"
+      req: "REQ-015, REQ-004"
+      title: "load_config() と Config dataclass を実装する"
+      description: |
+        src/utils/config.py を新設:
+
+          ```python
+          # src/utils/config.py
+          from __future__ import annotations
+          import dataclasses
+          import os
+          import yaml
+          from pathlib import Path
+          from typing import Any
+
+
+          class ConfigNotFoundError(Exception):
+              """configs/<name>.yaml が見つからない。"""
+
+
+          class ConfigSchemaError(Exception):
+              """configs/<name>.yaml のスキーマ違反。"""
+
+
+          @dataclasses.dataclass(slots=True, frozen=True)
+          class Config:
+              function_name: str
+              account_id: str
+              aws_region: str
+              assume_role_arn: str
+              log_group: str
+              profile_location: str
+              bedrock_model_id: str
+              bedrock_max_tokens: int
+              cloudwatch_logs_query_poll_interval_sec: float
+
+
+          _TEST_SUFFIX = "-test"
+
+
+          def normalize_alarm_name(alarm_name: str) -> str:
+              """alarm 名末尾の "-test" を除去した正規化名を返す。
+
+              "-test" 統合の不変条件 (SPEC definitions 参照) の単一実装点。
+              """
+              if alarm_name.endswith(_TEST_SUFFIX):
+                  return alarm_name[: -len(_TEST_SUFFIX)]
+              return alarm_name
+
+
+          def _configs_dir() -> Path:
+              if "LAMBDA_TASK_ROOT" in os.environ:
+                  return Path(os.environ["LAMBDA_TASK_ROOT"]) / "configs"
+              return Path(__file__).resolve().parents[2] / "configs"
+
+
+          _REQUIRED_FIELDS: dict[str, type] = {
+              "function_name": str,
+              "account_id": str,
+              "aws_region": str,
+              "assume_role_arn": str,
+              "log_group": str,
+              "profile_location": str,
+              "bedrock_model_id": str,
+              "bedrock_max_tokens": int,
+              "cloudwatch_logs_query_poll_interval_sec": float,
+          }
+
+
+          def load_config(alarm_name: str) -> Config:
+              """alarm_name から configs/<正規化名>.yaml を読み Config を返す。"""
+              normalized = normalize_alarm_name(alarm_name)
+              path = _configs_dir() / f"{normalized}.yaml"
+              if not path.exists():
+                  raise ConfigNotFoundError(
+                      f"config file not found: {path} "
+                      f"(alarm_name={alarm_name!r}, normalized={normalized!r})"
+                  )
+              try:
+                  with path.open(encoding="utf-8") as f:
+                      data = yaml.safe_load(f) or {}
+              except yaml.YAMLError as e:
+                  raise ConfigSchemaError(
+                      f"yaml parse failed for {path}: {e}"
+                  ) from e
+              if not isinstance(data, dict):
+                  raise ConfigSchemaError(
+                      f"config root must be a mapping, got {type(data).__name__}"
+                  )
+
+              for key, expected_type in _REQUIRED_FIELDS.items():
+                  if key not in data:
+                      raise ConfigSchemaError(
+                          f"{path}: missing required field {key!r}"
+                      )
+                  value = data[key]
+                  if expected_type is float and isinstance(value, int):
+                      value = float(value)
+                  elif not isinstance(value, expected_type):
+                      raise ConfigSchemaError(
+                          f"{path}: field {key!r} expected "
+                          f"{expected_type.__name__}, got {type(value).__name__}"
+                      )
+
+              return Config(
+                  function_name=data["function_name"],
+                  account_id=data["account_id"],
+                  aws_region=data["aws_region"],
+                  assume_role_arn=data["assume_role_arn"],
+                  log_group=data["log_group"],
+                  profile_location=data["profile_location"],
+                  bedrock_model_id=data["bedrock_model_id"],
+                  bedrock_max_tokens=data["bedrock_max_tokens"],
+                  cloudwatch_logs_query_poll_interval_sec=float(
+                      data["cloudwatch_logs_query_poll_interval_sec"]
+                  ),
+              )
+          ```
+
+        AC-015-1 (-test 正規化) は normalize_alarm_name() 単体テストで検証。
+        AC-015-2 (必須フィールド) は ConfigSchemaError 動作で検証。
+
+    # ============================================================
+    # TASK-005: signal_kind 解決と Bedrock 用整形
+    # ============================================================
+    - id: "TASK-005"
+      req: "REQ-005, REQ-008"
+      title: "resolve_signal_kind() と fallback_generic を実装する"
+      description: |
+        src/utils/signal.py を新設:
+
+          ```python
+          # src/utils/signal.py
+          from __future__ import annotations
+          from typing import Any
+          from .config import normalize_alarm_name
+
+
+          class SignalUnresolvedError(Exception):
+              """profile から alarm に対応する signal_kind が引けない。"""
+
+
+          # 汎用フォールバック signal_kind (REQ-008)
+          FALLBACK_GENERIC: dict[str, Any] = {
+              "name": "fallback_generic",
+              "type": "verdict",
+              "mechanism": "metric",
+              "locator": "CloudWatch メトリクス AWS/Lambda Errors",
+              "success_condition": "時間窓内に Errors > 0 のサンプルが存在しない",
+              "failure_condition": (
+                  "Errors > 0、または stack_trace/traceback が抽出ログに存在"
+              ),
+              "absence_hypothesis": (
+                  "Lambda invocation 自体が発生しておらず、"
+                  "メトリクスもログも生成されていない可能性"
+              ),
+              "max_severity_on_success": "MEDIUM",
+              "severity_on_absence": "MEDIUM",
+          }
+
+
+          def resolve_signal_kind(
+              alarm_name: str, profile: dict[str, Any]
+          ) -> dict[str, Any]:
+              """profile.signal[] と profile.signal_kind[] から該当 kind を返す。
+
+              解決不能 (alarm が signal[] に無い / kind 名が signal_kind[] に無い /
+              type != verdict) のとき SignalUnresolvedError を投げる。
+              呼び出し側で FALLBACK_GENERIC を採用するかは main 側の判断。
+              """
+              normalized = normalize_alarm_name(alarm_name)
+
+              # 1. signal[] から alarm name に該当するエントリ
+              entry = None
+              for s in profile.get("signal", []):
+                  if s.get("name") == normalized:
+                      entry = s
+                      break
+              if entry is None:
+                  raise SignalUnresolvedError(
+                      f"alarm {normalized!r} not in profile.signal[]"
+                  )
+
+              kind_name = entry.get("kind")
+
+              # 2. signal_kind[] からその名前のエントリ
+              for k in profile.get("signal_kind", []):
+                  if k.get("name") == kind_name:
+                      if k.get("type") != "verdict":
+                          raise SignalUnresolvedError(
+                              f"signal_kind {kind_name!r} has type "
+                              f"{k.get('type')!r}, expected 'verdict'"
+                          )
+                      return k
+
+              raise SignalUnresolvedError(
+                  f"signal_kind {kind_name!r} not found in profile.signal_kind[]"
+              )
+
+
+          def extract_ignored_signals(
+              profile: dict[str, Any]
+          ) -> list[dict[str, Any]]:
+              """profile.signal_kind[] から type=ignored を全抽出する。"""
+              return [
+                  k for k in profile.get("signal_kind", [])
+                  if k.get("type") == "ignored"
+              ]
+          ```
+
+        main 側のフォールバック分岐イメージ (TASK-013 で統合):
+
+          ```python
+          try:
+              signal_kind = resolve_signal_kind(alarm_name, profile)
+              fallback_kind = None
+          except SignalUnresolvedError as e:
+              logger.warning("signal unresolved", extra={"error": str(e)})
+              signal_kind = FALLBACK_GENERIC
+              fallback_kind = "signal_unresolved"
+          ```
+
+    # ============================================================
+    # TASK-006: Insights クエリの動的生成
+    # ============================================================
+    - id: "TASK-006"
+      req: "REQ-006"
+      title: "Insights クエリを input_identifiers から動的生成する"
+      description: |
+        src/utils/insights.py を新設 (既存の INSIGHTS_QUERY_TEMPLATE 撤去):
+
+          ```python
+          # src/utils/insights.py
+          from __future__ import annotations
+
+
+          _BASE_FIELDS: list[str] = [
+              "@timestamp", "@message", "level",
+              "function_request_id", "cold_start",
+              "phase", "exception_name", "message", "exception",
+              "xray_trace_id",
+          ]
+
+
+          def build_insights_query(
+              input_identifiers: list[str],
+              filter_value: str,
+              limit: int = 200,
+          ) -> str:
+              """profile.input_identifiers から fields 句と filter 句を生成する。
+
+              絞り込みキーは input_identifiers の先頭フィールドを使う
+              (例: filter ship_name = "sakura")。
+              """
+              if not input_identifiers:
+                  raise ValueError("input_identifiers must be non-empty")
+
+              all_fields = _BASE_FIELDS + list(input_identifiers)
+              fields_clause = "fields " + ", ".join(all_fields)
+              filter_key = input_identifiers[0]
+              filter_clause = f'filter {filter_key} = "{filter_value}"'
+
+              return "\n".join([
+                  fields_clause,
+                  f"| {filter_clause}",
+                  "| sort @timestamp desc",
+                  f"| limit {limit}",
+              ]) + "\n"
+          ```
+
+        main 側からの呼び出しイメージ:
+
+          ```python
+          query = build_insights_query(
+              input_identifiers=profile["input_identifiers"],
+              filter_value=ship_name,  # alarm 名から抽出した識別子値
+          )
+          ```
+
+    # ============================================================
+    # TASK-007: 静的システムプロンプトとメタ手続きの定義
+    # ============================================================
+    - id: "TASK-007"
+      req: "REQ-001, REQ-007, REQ-011"
+      title: "STATIC_SYSTEM_PROMPT を作成しケース分岐コードを撤去する"
+      description: |
+        src/utils/prompt.py を全面書き換え。既存の
+        _SYSTEM_PROMPT_TEMPLATE / render_prompt_case_no_logs /
+        render_prompt_case_lambda_failure / render_prompt_system_base /
+        render_prompt_user は全削除。
+
+        新 src/utils/prompt.py:
+
+          ```python
+          # src/utils/prompt.py
+          \"\"\"Bedrock への入力プロンプトを生成する純関数群。
+
+          設計方針:
+            - 静的システムプロンプトはメタ手続きのみ (監視対象固有語彙ゼロ)
+            - 動的コンテキストは render_dynamic_context() でアラームごとに合成
+            - 過去のケース分岐ロジック (no_logs / lambda_failure) は完全撤去
+          \"\"\"
+          from __future__ import annotations
+          from typing import Any
+
+
+          STATIC_SYSTEM_PROMPT = \"\"\"\\
+          あなたは AWS Lambda の障害分析担当です。提供される動的コンテキスト
+          (権威シグナル 1 個 + 障害根拠としない情報 + 抽出ログ等) を読み、
+          以下のメタ手続きで verdict を決定してください。
+
+          # メタ手続き (verdict 3 分岐)
+
+          1. 動的コンテキストの「権威シグナル」セクションに含まれる
+             success_condition / failure_condition / absence_hypothesis と
+             抽出ログを照合する。
+
+          2. success_condition を満たすレコードが時間窓内に存在する:
+             → verdict = "healthy"
+             severity は最大 MEDIUM (HIGH 禁止)。LOW にできるのは
+             抽出ログが完全に正常パターンのみのとき。
+
+          3. failure_condition を満たすレコード、または stack_trace /
+             traceback が抽出ログに存在する: → verdict = "failed"
+             severity = HIGH 固定。
+             failure_taxonomy で原因分類すること (b1〜b4 のいずれか)。
+
+          4. 上記いずれでもなく、権威シグナルが時間窓内に 1 件も観測されない:
+             → verdict = "absent"
+             severity = MEDIUM、confidence = "low" 固定。
+
+          # 補正規則
+
+          - 「障害根拠としない情報」セクション (ignored 系シグナル) に
+            列挙された情報を verdict=failed の根拠としないこと。
+            これらは設計上の許容分岐または上流データ品質問題で、本 Lambda の
+            責務外。
+          - secondary signals のログが見えても healthy 判断を妨げてはならない。
+
+          # failure_taxonomy (verdict=failed のとき必須分類)
+
+          - b1 コードバグ: KeyError / ValueError / AttributeError /
+            TypeError 等。stack_trace の最深フレーム (file:line) を特定する。
+          - b2 入力データ異常: 構造不整合 / 必須フィールド欠落 / 想定外の値域。
+            input_identifiers の値を参照し、全件失敗か特定 ZIP 依存かを判断。
+          - b3 設定欠落: os.environ KeyError / ImportError / 設定ファイル不在。
+          - b4 外部依存障害: AWS API 失敗 / DynamoDB throttle / AccessDenied 等。
+            AWS error code / HTTP status を引いて transient か permanent かを区別。
+
+          # 出力 JSON スキーマ (必ず厳守)
+
+          {
+            "verdict":    "healthy" | "failed" | "absent",
+            "severity":   "HIGH" | "MEDIUM" | "LOW",
+            "confidence": "high" | "medium" | "low",
+            "summary":    "string (<=80 文字。冒頭で verdict を識別)",
+            "detail":     "string (<=300 文字)",
+            "actions": [
+              {
+                "phase": "即時対応" | "調査手順" | "恒久対策",
+                "text":  "string (<=80 文字)"
+              }
+            ]
+          }
+
+          スキーマ外のキーを混ぜないこと。コードブロックや余計な前置きも禁止。
+          \"\"\"
+
+
+          def render_dynamic_context(
+              *,
+              alarm_name: str,
+              alarm_description: str,
+              fire_time_jst: str,
+              pre_classification: str,
+              signal_kind: dict[str, Any],
+              ignored_signals: list[dict[str, Any]],
+              input_identifiers: list[str],
+              research_window_jst: str,
+              formatted_logs: str,
+          ) -> str:
+              \"\"\"動的コンテキスト (user prompt) を組み立てる。\"\"\"
+              parts: list[str] = []
+
+              # 1. アラーム情報
+              parts.append("# アラーム情報")
+              parts.append(f"alarm_name:         {alarm_name}")
+              parts.append(f"alarm_description:  {alarm_description or '(none)'}")
+              parts.append(f"fire_time_jst:      {fire_time_jst}")
+              parts.append(f"pre_classification: {pre_classification}")
+              parts.append("")
+
+              # 2. 権威シグナル (verdict 判定の根拠)
+              parts.append("# 権威シグナル (signal_kind, 1 個)")
+              parts.append(f"name:                    {signal_kind['name']}")
+              parts.append(f"type:                    {signal_kind['type']}")
+              parts.append(f"mechanism:               {signal_kind['mechanism']}")
+              parts.append(f"locator:                 {signal_kind['locator']}")
+              parts.append(f"success_condition:       {signal_kind['success_condition']}")
+              parts.append(f"failure_condition:       {signal_kind['failure_condition']}")
+              parts.append(f"absence_hypothesis:      {signal_kind['absence_hypothesis']}")
+              parts.append(f"max_severity_on_success: {signal_kind['max_severity_on_success']}")
+              parts.append(f"severity_on_absence:     {signal_kind['severity_on_absence']}")
+              parts.append("")
+
+              # 3. 障害根拠としない情報 (ignored 系)
+              parts.append("# 障害根拠としない情報")
+              if ignored_signals:
+                  for sig in ignored_signals:
+                      parts.append(
+                          f"- name={sig['name']} mechanism={sig['mechanism']}"
+                      )
+                      parts.append(f"  locator: {sig['locator']}")
+                      parts.append(f"  description: {sig['description']}")
+              else:
+                  parts.append("(なし)")
+              parts.append("")
+
+              # 4. 実行識別フィールド
+              parts.append("# 実行識別フィールド (input_identifiers)")
+              parts.append(", ".join(input_identifiers))
+              parts.append("")
+
+              # 5. 調査時間窓
+              parts.append("# 調査時間窓 (JST)")
+              parts.append(research_window_jst)
+              parts.append("")
+
+              # 6. 抽出ログ
+              parts.append("# 抽出ログ (時間窓内・時刻昇順)")
+              parts.append(formatted_logs.rstrip())
+
+              return "\\n".join(parts)
+          ```
+
+        撤去するもの:
+          - _SYSTEM_PROMPT_TEMPLATE (旧静的プロンプト)
+          - render_prompt_case_no_logs
+          - render_prompt_case_lambda_failure
+          - render_prompt_system_base
+          - render_prompt_user
+
+    # ============================================================
+    # TASK-008: 出力 JSON 正規化と severity 補正
+    # ============================================================
+    - id: "TASK-008"
+      req: "REQ-007, REQ-009"
+      title: "Bedrock 応答の正規化 + severity 補正を実装する"
+      description: |
+        src/utils/response.py を新設:
+
+          ```python
+          # src/utils/response.py
+          from __future__ import annotations
+          import json
+          from typing import Any
+
+
+          _VALID_VERDICTS = ("healthy", "failed", "absent")
+          _VALID_SEVERITIES = ("HIGH", "MEDIUM", "LOW")
+          _VALID_CONFIDENCES = ("high", "medium", "low")
+          _VALID_PHASES = ("即時対応", "調査手順", "恒久対策")
+
+          _MAX_SUMMARY_CHARS = 80
+          _MAX_DETAIL_CHARS = 300
+          _MAX_ACTION_TEXT_CHARS = 80
+
+          _SEVERITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+          def normalize_bedrock_response(text: str) -> dict[str, Any]:
+              \"\"\"Bedrock 応答テキストを JSON パース + スキーマ整形する。
+
+              欠落キー・enum 外値・字数超過は安全側に丸める (通知欠落させない)。
+              \"\"\"
+              try:
+                  data = json.loads(text)
+              except json.JSONDecodeError:
+                  data = {}
+              if not isinstance(data, dict):
+                  data = {}
+
+              verdict = data.get("verdict")
+              if verdict not in _VALID_VERDICTS:
+                  verdict = "absent"  # 安全側既定
+
+              severity = (str(data.get("severity") or "")).upper()
+              if severity not in _VALID_SEVERITIES:
+                  severity = "MEDIUM"
+
+              confidence = (str(data.get("confidence") or "")).lower()
+              if confidence not in _VALID_CONFIDENCES:
+                  confidence = "low"
+
+              summary = str(data.get("summary") or "(要約取得失敗)")
+              summary = summary[:_MAX_SUMMARY_CHARS]
+
+              detail = str(data.get("detail") or "(詳細取得失敗)")
+              detail = detail[:_MAX_DETAIL_CHARS]
+
+              raw_actions = data.get("actions") or []
+              actions: list[dict[str, str]] = []
+              if isinstance(raw_actions, list):
+                  for item in raw_actions:
+                      if not isinstance(item, dict):
+                          continue
+                      phase = item.get("phase")
+                      if phase not in _VALID_PHASES:
+                          continue
+                      text_value = str(item.get("text") or "")[:_MAX_ACTION_TEXT_CHARS]
+                      if not text_value:
+                          continue
+                      actions.append({"phase": phase, "text": text_value})
+
+              return {
+                  "verdict": verdict,
+                  "severity": severity,
+                  "confidence": confidence,
+                  "summary": summary,
+                  "detail": detail,
+                  "actions": actions,
+              }
+
+
+          def apply_severity_policy(
+              response: dict[str, Any], signal_kind: dict[str, Any]
+          ) -> dict[str, Any]:
+              \"\"\"signal_kind 由来の severity ポリシーで応答を補正する。
+
+              - verdict=healthy: max_severity_on_success で clamp
+              - verdict=absent : severity_on_absence で上書き、confidence=low
+              - verdict=failed : 補正なし (HIGH のまま)
+              \"\"\"
+              verdict = response["verdict"]
+              if verdict == "healthy":
+                  ceiling = signal_kind.get("max_severity_on_success", "MEDIUM")
+                  response["severity"] = _clamp_severity(
+                      response["severity"], ceiling
+                  )
+              elif verdict == "absent":
+                  response["severity"] = signal_kind.get(
+                      "severity_on_absence", "MEDIUM"
+                  )
+                  response["confidence"] = "low"
+              # failed: no-op
+              return response
+
+
+          def _clamp_severity(value: str, ceiling: str) -> str:
+              v_rank = _SEVERITY_ORDER.get(value, 1)
+              c_rank = _SEVERITY_ORDER.get(ceiling, 1)
+              if v_rank <= c_rank:
+                  return value
+              # ceiling 以下に丸める
+              return ceiling
+          ```
+
+    # ============================================================
+    # TASK-009: webhook URL 解決と env_label 導出
+    # ============================================================
+    - id: "TASK-009"
+      req: "REQ-016, REQ-013"
+      title: "DISCORD_WEBHOOK_URLS のパースと resolve_webhook_url を実装する"
+      description: |
+        src/utils/webhooks.py を新設:
+
+          ```python
+          # src/utils/webhooks.py
+          from __future__ import annotations
+          import json
+          import os
+          from .config import normalize_alarm_name
+
+
+          class WebhookConfigError(Exception):
+              \"\"\"DISCORD_WEBHOOK_URLS が不正。\"\"\"
+
+
+          def _load_webhook_map() -> dict[str, str]:
+              raw = os.environ.get("DISCORD_WEBHOOK_URLS")
+              if not raw:
+                  raise WebhookConfigError(
+                      "DISCORD_WEBHOOK_URLS env var is not set"
+                  )
+              try:
+                  parsed = json.loads(raw)
+              except json.JSONDecodeError as e:
+                  raise WebhookConfigError(
+                      f"DISCORD_WEBHOOK_URLS is not valid JSON: {e}"
+                  ) from e
+              if not isinstance(parsed, dict):
+                  raise WebhookConfigError(
+                      f"DISCORD_WEBHOOK_URLS must be a JSON object, "
+                      f"got {type(parsed).__name__}"
+                  )
+              # AC-016-4: "-test" 末尾キーを検出して warning
+              for key in parsed:
+                  if key.endswith("-test"):
+                      # logger は呼び出し側で取り、ここでは print fallback
+                      # (Powertools Logger は import 時のサイクルを避ける)
+                      pass  # main で警告ログを出す
+              return {str(k): str(v) for k, v in parsed.items()}
+
+
+          # モジュールスコープでキャッシュ (cold start 時に 1 回だけパース)
+          # 不正 JSON は ImportError 相当 (Lambda 起動時に明確 fail)
+          WEBHOOK_MAP: dict[str, str] = _load_webhook_map()
+
+
+          def resolve_webhook_url(alarm_name: str) -> str | None:
+              \"\"\"正規化後 alarm 名で webhook URL を引く。不在は None。\"\"\"
+              normalized = normalize_alarm_name(alarm_name)
+              return WEBHOOK_MAP.get(normalized)
+
+
+          def derive_env_label(alarm_name: str) -> str:
+              \"\"\"alarm 名末尾の "-test" 有無から "test" / "prod" を返す。\"\"\"
+              return "test" if alarm_name.endswith("-test") else "prod"
+          ```
+
+        cold start で失敗させる構造により AC-016-1 (silent failure 防止) を
+        満たす。
+
+    # ============================================================
+    # TASK-010: レポートヘッダーレンダリングと Discord embed
+    # ============================================================
+    - id: "TASK-010"
+      req: "REQ-010"
+      title: "render_report_embed() を実装する"
+      description: |
+        src/utils/report.py を新設 (現状 src/main.py 内の embed 組み立て箇所を
+        集約):
+
+          ```python
+          # src/utils/report.py
+          from __future__ import annotations
+          from typing import Any
+          from discord_webhook import DiscordEmbed
+          from .webhooks import derive_env_label
+
+
+          _SEVERITY_COLOR = {
+              "HIGH": 0xE74C3C,    # 赤
+              "MEDIUM": 0xF1C40F,  # 黄
+              "LOW": 0x2ECC71,     # 緑
+          }
+
+
+          def render_report_embed(
+              *,
+              alarm_name: str,
+              alarm_description: str,
+              function_name: str,
+              research_window_jst: str,
+              response: dict[str, Any],
+              fallback_kind: str | None,
+              representative_request_id: str | None,
+              fire_timestamp_iso: str,
+          ) -> DiscordEmbed:
+              \"\"\"Bedrock 応答 + アラーム入力からレポート Embed を組み立てる。
+
+              ヘッダー (Title / Target / ResearchWindow / Alarm) は決定論的に
+              レンダリング。LLM 出力依存は summary / detail / actions のみ。
+              \"\"\"
+              embed = DiscordEmbed(
+                  title=response["summary"][:256],
+                  color=_SEVERITY_COLOR.get(response["severity"], 0x95A5A6),
+              )
+              env_label = derive_env_label(alarm_name)
+              embed.set_author(name=f"HDW Notify · {env_label}")
+
+              # Target / Alarm / 件数相当 (3 inline)
+              embed.add_embed_field(name="Target", value=function_name, inline=True)
+              embed.add_embed_field(
+                  name="Alarm",
+                  value=f"{alarm_name} [{alarm_description or '(none)'}]",
+                  inline=True,
+              )
+              embed.add_embed_field(
+                  name="verdict",
+                  value=response["verdict"],
+                  inline=True,
+              )
+
+              # ResearchWindow (専有 1 行)
+              embed.add_embed_field(
+                  name="ResearchWindow",
+                  value=research_window_jst,
+                  inline=False,
+              )
+
+              # Report(Summary)
+              embed.add_embed_field(
+                  name=f"Report (confidence: {response['confidence']})",
+                  value=response["summary"],
+                  inline=False,
+              )
+
+              # Report(Detail)
+              embed.add_embed_field(
+                  name="Detail",
+                  value=response["detail"] or "(none)",
+                  inline=False,
+              )
+
+              # Action (3 行構造、欠落 phase は "(なし)")
+              actions_by_phase: dict[str, str] = {
+                  a["phase"]: a["text"] for a in response.get("actions", [])
+              }
+              action_text = "\\n".join([
+                  f"[即時対応] {actions_by_phase.get('即時対応', '(なし)')}",
+                  f"[調査手順] {actions_by_phase.get('調査手順', '(なし)')}",
+                  f"[恒久対策] {actions_by_phase.get('恒久対策', '(なし)')}",
+              ])
+              embed.add_embed_field(name="Action", value=action_text, inline=False)
+
+              # footer (request_id + fallback 印)
+              footer_parts: list[str] = []
+              if representative_request_id:
+                  footer_parts.append(f"req-id: {representative_request_id}")
+              if fallback_kind:
+                  footer_parts.append(f"fallback: {fallback_kind}")
+              if footer_parts:
+                  embed.set_footer(text=" / ".join(footer_parts))
+              embed.set_timestamp(fire_timestamp_iso)
+              return embed
+          ```
+
+        AC-010-1 (ヘッダーが LLM 出力に依存しない) は、response の全フィールドを
+        空にしても Target / Alarm / ResearchWindow が描画されることで担保。
+
+    # ============================================================
+    # TASK-011: HDW_Backend_Processor_0001 profile YAML 作成と配置
+    # ============================================================
+    - id: "TASK-011"
+      req: "REQ-002, REQ-003"
+      title: "HDW_Backend_Processor_0001 の profile YAML を作成し S3 に手動配置する"
+      description: |
+        現状 src/utils/prompt.py に埋め込まれている運用前提を移植して
+        profile YAML を作成し、運用 Lambda S3 に手動 put する。
+
+        作成する profile YAML (例):
+
+          ```yaml
+          function_name: HDW_Backend_Processor_0001
+
+          signal_kind:
+            - name: completion_success
+              type: verdict
+              mechanism: log_marker
+              locator: 'event="lambda_complete" 行の status フィールド'
+              success_condition: 'status == "success" のレコードが 1 件以上存在'
+              failure_condition: 'status == "error"、または stack_trace/traceback が存在'
+              absence_hypothesis: 'S3 への ZIP アップロード自体が発生せず Lambda 未起動'
+              max_severity_on_success: MEDIUM
+              severity_on_absence: MEDIUM
+
+            - name: ng_file
+              type: ignored
+              mechanism: log_marker
+              locator: 'message に "NG file" を含む行'
+              description: '設計上の許容分岐 — 障害根拠としない'
+
+            - name: pia_data_none
+              type: ignored
+              mechanism: log_marker
+              locator: 'message に "pia_data is None" を含む行'
+              description: '上流のデータ品質問題 — 障害根拠としない'
+
+            - name: csv_parse_failed
+              type: ignored
+              mechanism: log_marker
+              locator: 'message に "csv parse failed" を含む行'
+              description: '上流のデータ品質問題 — 障害根拠としない'
+
+          signal:
+            - name: hdw-sakura
+              kind: completion_success
+
+          input_identifiers: [ship_name, ship_timestamp, input_key]
+          ```
+
+        配置コマンド (Phase A 手動):
+
+          ```bash
+          aws s3 cp profile.yaml \\
+            s3://<client-bucket>/<CONTEXT_PREFIX>/<PROFILE_FILE> \\
+            --profile hanshin-t.kimura --region ap-northeast-1
+          ```
+
+        将来 Duration p99 アラーム等を追加する場合は signal_kind に latency
+        エントリを追加し、signal にも対応する alarm 行を追加する。
+
+    # ============================================================
+    # TASK-012: 旧コード削除と env var 整理
+    # ============================================================
+    - id: "TASK-012"
+      req: "REQ-011, REQ-012, REQ-013"
+      title: "旧 Env / 旧プロンプト関連コードを削除し env var を整理する"
+      description: |
+        削除する src/main.py の要素:
+          - Env dataclass 全削除
+          - _load_alarm_log_groups() と _ALARM_LOG_GROUPS 削除
+          - INSIGHTS_QUERY_TEMPLATE 削除 (TASK-006 の build_insights_query に置換)
+          - DISCORD_SEVERITY_COLOR 削除 (TASK-010 の _SEVERITY_COLOR に置換)
+          - ENVIRONMENT_NAME 参照削除 (derive_env_label に置換)
+          - _normalize_report 削除 (TASK-008 の normalize_bedrock_response に置換)
+
+        削除する src/utils/prompt.py の要素 (TASK-007 と統合):
+          - _SYSTEM_PROMPT_TEMPLATE
+          - render_prompt_system_base
+          - render_prompt_case_no_logs
+          - render_prompt_case_lambda_failure
+          - render_prompt_user
+
+        削除する設定:
+          - config/alarm_log_groups.yml
+          - Dockerfile の config/ COPY (configs/ に変更)
+
+        GitHub Actions のデプロイジョブから削除する env var 配信:
+          - CROSS_ACCOUNT_ROLE_ARN
+          - TARGET_FUNCTION_NAME
+          - BEDROCK_MODEL_ID
+          - BEDROCK_MAX_TOKENS
+          - CLOUDWATCH_LOGS_QUERY_POLL_INTERVAL_SEC
+          - DISCORD_WEBHOOK_URL (無印)
+          - ENVIRONMENT_NAME
+          - LOG_GROUP_MAP
+
+        残す env var:
+          - DISCORD_WEBHOOK_URLS (JSON 文字列)
+
+    # ============================================================
+    # TASK-013: オーケストレーター統合
+    # ============================================================
+    - id: "TASK-013"
+      req: "ALL"
+      title: "src/main.py を新オーケストレーターに書き換える"
+      description: |
+        src/main.py を以下の構造に書き換える (擬似コード):
+
+          ```python
+          # src/main.py
+          from __future__ import annotations
+
+          import json
+          import re
+          import time
+          import urllib.parse
+          from datetime import datetime, timedelta, timezone
+          from typing import Any
+
+          import boto3
+          from aws_lambda_powertools import Logger
+          from botocore.exceptions import BotoCoreError, ClientError
+          from discord_webhook import DiscordWebhook, DiscordEmbed
+
+          from utils.config import (
+              Config, load_config, normalize_alarm_name,
+              ConfigNotFoundError, ConfigSchemaError,
+          )
+          from utils.profile import (
+              fetch_profile, ProfileSchemaError,
+          )
+          from utils.signal import (
+              resolve_signal_kind, extract_ignored_signals,
+              FALLBACK_GENERIC, SignalUnresolvedError,
+          )
+          from utils.insights import build_insights_query
+          from utils.prompt import STATIC_SYSTEM_PROMPT, render_dynamic_context
+          from utils.response import (
+              normalize_bedrock_response, apply_severity_policy,
+          )
+          from utils.report import render_report_embed
+          from utils.webhooks import resolve_webhook_url, derive_env_label
+
+          logger = Logger()
+          JST = timezone(timedelta(hours=9))
+          INSIGHTS_QUERY_TIMEOUT_SEC = 60.0
+          SHIP_LOG_WINDOW_MIN = 330  # 5h30m
+          ALARM_NAME_RE = re.compile(r"^hdw-(?P<ship_name>[a-z][a-z0-9]*)(?:-test)?$")
+
+
+          def _format_window_jst(start: datetime, end: datetime) -> str:
+              s = start.astimezone(JST)
+              e = end.astimezone(JST)
+              return f"{s.strftime('%Y-%m-%d %H:%M')}–{e.strftime('%H:%M')} JST"
+
+
+          def _extract_ship_name(alarm_name: str) -> str | None:
+              m = ALARM_NAME_RE.fullmatch(alarm_name)
+              return m.group("ship_name") if m else None
+
+
+          def _post_minimal_fallback(
+              webhook_url: str | None,
+              alarm_name: str,
+              fire_time_iso: str,
+              note: str,
+              color: int = 0xF1C40F,
+          ) -> None:
+              \"\"\"プロファイル / signal 解決失敗時の最小通知。\"\"\"
+              if not webhook_url:
+                  logger.warning("webhook not set, skip discord post",
+                                 extra={"alarm_name": alarm_name})
+                  return
+              webhook = DiscordWebhook(url=webhook_url)
+              embed = DiscordEmbed(title=note[:256], color=color)
+              embed.set_author(
+                  name=f"HDW Notify · {derive_env_label(alarm_name)}"
+              )
+              embed.add_embed_field(name="Alarm", value=alarm_name, inline=False)
+              embed.set_timestamp(fire_time_iso)
+              webhook.add_embed(embed)
+              webhook.execute()
+
+
+          @logger.inject_lambda_context(log_event=True)
+          def main(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
+              # 1. SNS event 解析
+              sns_msg = json.loads(event["Records"][0]["Sns"]["Message"])
+              alarm_name = sns_msg["AlarmName"]
+              alarm_description = sns_msg.get("AlarmDescription", "")
+              fire_time_iso = sns_msg["StateChangeTime"]
+              fire_time = datetime.fromisoformat(fire_time_iso.replace("Z", "+00:00"))
+              start = fire_time - timedelta(minutes=SHIP_LOG_WINDOW_MIN)
+              end = fire_time
+              research_window_jst = _format_window_jst(start, end)
+              webhook_url = resolve_webhook_url(alarm_name)
+              logger.append_keys(alarm=alarm_name)
+
+              # 2. Config 取得
+              fallback_kind: str | None = None
+              try:
+                  config = load_config(alarm_name)
+              except (ConfigNotFoundError, ConfigSchemaError) as e:
+                  logger.exception("config load failed")
+                  _post_minimal_fallback(
+                      webhook_url, alarm_name, fire_time_iso,
+                      note=f"設定不在: {type(e).__name__}",
+                  )
+                  return {
+                      "ok": True, "alarm": alarm_name,
+                      "fallback": "profile_missing",
+                  }
+
+              # 3. AssumeRole + S3/Logs client 構築
+              try:
+                  sts_resp = boto3.client("sts").assume_role(
+                      RoleArn=config.assume_role_arn,
+                      RoleSessionName=f"hdw-notify-{context.aws_request_id}",
+                      DurationSeconds=900,
+                  )
+                  creds = sts_resp["Credentials"]
+              except (BotoCoreError, ClientError) as e:
+                  logger.exception("assume_role failed")
+                  _post_minimal_fallback(
+                      webhook_url, alarm_name, fire_time_iso,
+                      note=f"AssumeRole 失敗: {type(e).__name__}",
+                      color=0xE74C3C,
+                  )
+                  return {"ok": True, "alarm": alarm_name, "fallback": "assume_role_failed"}
+
+              s3_client = boto3.client(
+                  "s3",
+                  region_name=config.aws_region,
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+              logs_client = boto3.client(
+                  "logs",
+                  region_name=config.aws_region,
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+
+              # 4. profile 取得
+              try:
+                  profile = fetch_profile(s3_client, config.profile_location)
+              except ProfileSchemaError as e:
+                  logger.exception("profile fetch/schema failed")
+                  _post_minimal_fallback(
+                      webhook_url, alarm_name, fire_time_iso,
+                      note=f"プロファイル取得失敗: {type(e).__name__}",
+                  )
+                  return {"ok": True, "alarm": alarm_name, "fallback": "profile_missing"}
+
+              # 5. signal_kind 解決 (REQ-005 / REQ-008 (b))
+              try:
+                  signal_kind = resolve_signal_kind(alarm_name, profile)
+              except SignalUnresolvedError as e:
+                  logger.warning("signal unresolved", extra={"error": str(e)})
+                  signal_kind = FALLBACK_GENERIC
+                  fallback_kind = "signal_unresolved"
+
+              ignored_signals = extract_ignored_signals(profile)
+              pre_classification = signal_kind["name"]
+
+              # 6. Insights クエリ実行
+              ship_name = _extract_ship_name(alarm_name) or "unknown"
+              query = build_insights_query(
+                  input_identifiers=profile["input_identifiers"],
+                  filter_value=ship_name,
+              )
+              query_id = logs_client.start_query(
+                  logGroupName=config.log_group,
+                  startTime=int(start.timestamp()),
+                  endTime=int(end.timestamp()),
+                  queryString=query,
+              )["queryId"]
+              log_rows: list[list[dict[str, str]]] = []
+              deadline = time.monotonic() + INSIGHTS_QUERY_TIMEOUT_SEC
+              while True:
+                  result = logs_client.get_query_results(queryId=query_id)
+                  if result["status"] == "Complete":
+                      log_rows = result.get("results", [])
+                      break
+                  if result["status"] in ("Failed", "Cancelled", "Timeout"):
+                      logger.warning("insights query failed",
+                                     extra={"status": result["status"]})
+                      log_rows = []
+                      break
+                  if time.monotonic() >= deadline:
+                      logger.warning("insights query timed out")
+                      log_rows = []
+                      break
+                  time.sleep(config.cloudwatch_logs_query_poll_interval_sec)
+
+              # 7. ログ整形 (既存の _format_log_rows_pretty を流用)
+              from utils.log_format import format_log_rows_pretty
+              formatted_logs = format_log_rows_pretty(log_rows)
+
+              # 8. 動的コンテキスト組み立て
+              user_prompt = render_dynamic_context(
+                  alarm_name=alarm_name,
+                  alarm_description=alarm_description,
+                  fire_time_jst=fire_time.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S JST"),
+                  pre_classification=pre_classification,
+                  signal_kind=signal_kind,
+                  ignored_signals=ignored_signals,
+                  input_identifiers=profile["input_identifiers"],
+                  research_window_jst=research_window_jst,
+                  formatted_logs=formatted_logs,
+              )
+
+              # 9. Bedrock 呼び出し
+              try:
+                  br = boto3.client("bedrock-runtime").converse(
+                      modelId=config.bedrock_model_id,
+                      system=[{"text": STATIC_SYSTEM_PROMPT}],
+                      messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+                      inferenceConfig={"maxTokens": config.bedrock_max_tokens},
+                  )
+                  report_text = br["output"]["message"]["content"][0]["text"]
+              except (BotoCoreError, ClientError, KeyError) as e:
+                  logger.exception("bedrock call failed")
+                  _post_minimal_fallback(
+                      webhook_url, alarm_name, fire_time_iso,
+                      note=f"Bedrock 失敗: {type(e).__name__}",
+                  )
+                  return {"ok": True, "alarm": alarm_name, "fallback": "bedrock_failed"}
+
+              # 10. 応答正規化 + severity 補正
+              response = normalize_bedrock_response(report_text)
+              response = apply_severity_policy(response, signal_kind)
+
+              # 11. レポート embed 組み立て + Discord 投稿
+              representative_request_id = _extract_first_request_id(log_rows)
+              embed = render_report_embed(
+                  alarm_name=alarm_name,
+                  alarm_description=alarm_description,
+                  function_name=config.function_name,
+                  research_window_jst=research_window_jst,
+                  response=response,
+                  fallback_kind=fallback_kind,
+                  representative_request_id=representative_request_id,
+                  fire_timestamp_iso=fire_time_iso,
+              )
+              if webhook_url:
+                  webhook = DiscordWebhook(url=webhook_url)
+                  webhook.add_embed(embed)
+                  webhook.execute()
+              else:
+                  logger.warning("webhook not registered",
+                                 extra={"alarm_name": alarm_name})
+
+              return {
+                  "ok": True,
+                  "alarm": alarm_name,
+                  "verdict": response["verdict"],
+                  "severity": response["severity"],
+                  "fallback": fallback_kind,
+              }
+
+
+          def _extract_first_request_id(rows: list[list[dict[str, str]]]) -> str | None:
+              if not rows:
+                  return None
+              for item in rows[0]:
+                  if item.get("field") == "function_request_id":
+                      return item.get("value")
+              return None
+          ```
+
+        既存の _format_log_rows_pretty は src/utils/log_format.py に移植して
+        再利用する (本 SPEC のスコープ外、清書のみ)。
+
+    # ============================================================
+    # TASK-014: 新規アラーム追加デプロイ手順を文書化
+    # ============================================================
+    - id: "TASK-014"
+      req: "REQ-014"
+      title: "新規アラーム追加デプロイ手順を本 PLAN に文書化する"
+      description: |
+        deployment_workflow セクション (下記) を本 PLAN の付録として参照可能に
+        する。SPEC 完成後の運用ガイドのドラフト。
+
+        ## 全ケース共通手順
+
+        1. configs/<正規化 alarm 名>.yaml を新規作成し PR → merge
+           - 必須 9 フィールド (REQ-013) を埋める
+           - ファイル名は alarm 名末尾 "-test" を除いたもの
+
+        5. GitHub Actions secrets の DISCORD_WEBHOOK_URLS (JSON) に
+           "<正規化 alarm 名>": "<webhook URL>" を追加。
+
+        6. Reporter Lambda を再ビルド・再デプロイ
+           - configs/ 同梱と env var 更新の反映
+
+        ## 新クライアント追加時の追加手順
+
+        2. クライアント S3 に <PROFILE_FILE> を手動配置:
+
+           ```bash
+           aws s3 cp profile.yaml \\
+             s3://<client-bucket>/<CONTEXT_PREFIX>/<PROFILE_FILE> \\
+             --profile <client-profile>
+           ```
+
+        3. クライアント側 AssumeRole 対象 Role に追加:
+
+           ```json
+           {
+             "Effect": "Allow",
+             "Action": ["s3:GetObject"],
+             "Resource":
+               "arn:aws:s3:::<client-bucket>/<CONTEXT_PREFIX>/*"
+           },
+           {
+             "Effect": "Allow",
+             "Action": ["s3:ListBucket"],
+             "Resource": "arn:aws:s3:::<client-bucket>",
+             "Condition": {
+               "StringLike": { "s3:prefix": "<CONTEXT_PREFIX>/*" }
+             }
+           }
+           ```
+
+        4. バケット KMS CMK 暗号化時のみ。CMK 側に cross-account
+           kms:Decrypt grant を追加。
+
+        ## 既存クライアントの新アラーム追加時
+
+        手順 2〜4 をスキップ (既存 IAM / S3 / KMS を流用)。
+
+        ## 不変条件 (両ケース共通)
+
+        - 運用 Lambda のコード・実行 IAM Role・CI/CD パイプライン定義に
+          変更を加えない (REQ-003 AC-003-2)
+        - 手順 1 / 5 / 6 は自社側作業、手順 2 / 3 / 4 はクライアント側作業
+
+        ## 失敗モード (片方欠落時)
+
+        - 手順 1 欠落 → load_config() が ConfigNotFoundError →
+          REQ-008 (a) フォールバック
+        - 手順 5 欠落 → resolve_webhook_url() が None → CloudWatch Logs に
+          warning 記録のみ (REQ-016 AC-016-3)

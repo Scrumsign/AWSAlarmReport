@@ -32,11 +32,17 @@ import boto3
 import yaml
 from aws_lambda_powertools import Logger
 from botocore.exceptions import BotoCoreError, ClientError
-from discord_webhook import DiscordEmbed, DiscordWebhook
+from channels.discord import (
+    DISCORD_SEVERITY_COLOR,
+    DiscordChannel,
+    _post_minimal_embed,
+    _post_prompt_attachment,
+)
+from channels.email import SESEmailChannel
+from channels.message import Message
 
 from utils.prompt import (
-    render_prompt_case_lambda_failure,
-    render_prompt_system_base,
+    build_system_prompt,
     render_prompt_user,
 )
 
@@ -61,15 +67,6 @@ Lambda 側は aws_lambda_powertools.Logger 出力の JSON 構造化ログで、A
 * ``ship_name`` / ``ship_timestamp`` / ``input_key`` … 処理対象の識別子
 * ``exception_name`` / ``exception`` … 例外クラスと traceback 文字列
 * ``function_request_id`` / ``xray_trace_id`` … トレース用
-"""
-
-DISCORD_SEVERITY_COLOR: dict[str, int] = {
-    "LOW": 0x2ECC71,    # green
-    "MEDIUM": 0xF1C40F,  # yellow
-    "HIGH": 0xE74C3C,   # red
-}
-"""
-severity → Discord Embed カラー (10 進 RGB) マップ（アプリ内部ロジック）。
 """
 
 INSIGHTS_QUERY_TIMEOUT_SEC = 60.0
@@ -113,6 +110,105 @@ _ALARM_LOG_GROUPS: dict[str, list[str]] = _load_alarm_log_groups()
 """
 
 
+def _load_error_profiles() -> dict[str, dict]:
+    """
+    config/error-profiles.yml を読み込み ``{error_id: entry}`` の辞書を返す。
+
+    ``_load_alarm_log_groups`` と同じパス解決ロジックを使い、Lambda 環境では
+    ``LAMBDA_TASK_ROOT/config/``、ローカルではプロジェクトルートの ``config/`` を参照する。
+    """
+    if "LAMBDA_TASK_ROOT" in os.environ:
+        config_dir = Path(os.environ["LAMBDA_TASK_ROOT"]) / "config"
+    else:
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+    entries: list[dict] = yaml.safe_load(
+        (config_dir / "error-profiles.yml").read_text(encoding="utf-8")
+    )
+    return {e["id"]: e for e in entries}
+
+
+def _resolve_channel_ids(error_id: str, profiles: dict[str, dict]) -> list[str]:
+    """
+    error_id に対応するチャネル ID リストを返す。
+
+    error-profiles.yml に存在しない error_id は WARNING を出して ``["discord"]`` で
+    フォールバックする（通知欠落を防ぐ最終安全網）。
+    """
+    entry = profiles.get(error_id)
+    if entry is None:
+        logger.warning(
+            "error_id not found in error-profiles.yml, falling back to discord",
+            extra={"error_id": error_id},
+        )
+        return ["discord"]
+    return list(entry["channels"])
+
+
+def _resolve_error_id(alarm_name: str, log_rows: list) -> str:
+    """
+    alarm_name パターンとログ内容から error_id を4分岐で返す。
+
+    1. alarm_name が命名規約外 → ``"unknown_alarm"``
+    2. log_rows が空（Lambda 未起動）→ ``"s3_data_missing"``
+    3. log_rows に ``status=error`` フィールドが存在 → ``"lambda_failure"``
+    4. log_rows あり、status=error なし → ``"unknown"``
+    """
+    if not ALARM_NAME_RE.match(alarm_name):
+        logger.warning(
+            "unknown alarm_name pattern", extra={"alarm_name": alarm_name}
+        )
+        return "unknown_alarm"
+    if not log_rows:
+        return "s3_data_missing"
+    if any(
+        f.get("field") == "status" and f.get("value") == "error"
+        for row in log_rows
+        for f in row
+    ):
+        return "lambda_failure"
+    logger.warning(
+        "logs exist but no error status found", extra={"alarm_name": alarm_name}
+    )
+    return "unknown"
+
+
+def _build_channel_registry(
+    channel_ids: list[str], env: "Env"
+) -> "dict[str, Any]":
+    registry: dict[str, Any] = {
+        "discord": DiscordChannel(
+            webhook_url=env.discord_webhook_url,
+            environment_name=env.environment_name,
+            target_function_name=env.target_function_name,
+        ),
+    }
+    for cid in channel_ids:
+        if cid.startswith("email."):
+            group_id = cid.split(".", 1)[1]
+            registry[cid] = SESEmailChannel(group_id=group_id)
+    return registry
+
+
+def _dispatch(alarm_name: str, message: Message, error_id: str, env: "Env") -> None:
+    profiles = _load_error_profiles()
+    channel_ids = _resolve_channel_ids(error_id, profiles)
+    registry = _build_channel_registry(channel_ids, env)
+
+    for cid in channel_ids:
+        channel = registry.get(cid)
+        if channel is None:
+            logger.warning(
+                "channel_id not in registry, skipping", extra={"channel_id": cid}
+            )
+            continue
+        try:
+            channel.send(message)
+        except Exception:
+            logger.warning(
+                "channel send failed", extra={"channel_id": cid}, exc_info=True
+            )
+
+
 @dataclasses.dataclass(slots=True, frozen=True)
 class Env:
     """
@@ -124,7 +220,6 @@ class Env:
 
     discord_webhook_url: str
     cross_account_role_arn: str
-    external_id: str
     cloudwatch_logs_query_poll_interval_sec: float
     bedrock_model_id: str
     bedrock_max_tokens: int
@@ -136,7 +231,6 @@ class Env:
         return cls(
             discord_webhook_url=os.environ["DISCORD_WEBHOOK_URL"],
             cross_account_role_arn=os.environ["CROSS_ACCOUNT_ROLE_ARN"],
-            external_id=os.environ["EXTERNAL_ID"],
             cloudwatch_logs_query_poll_interval_sec=float(
                 os.environ["CLOUDWATCH_LOGS_QUERY_POLL_INTERVAL_SEC"]
             ),
@@ -401,90 +495,6 @@ def _format_log_rows_pretty(log_rows: list[list[dict[str, str]]]) -> str:
     return "\n".join(out)
 
 
-def _post_prompt_attachment(
-    webhook_url: str,
-    alarm_name: str,
-    system_prompt: str,
-    user_text: str,
-) -> None:
-    """
-    Bedrock に投げた完全 prompt (system + user) を Discord に添付ファイルとして
-    別 webhook で投稿する。LLM レポート (5W1H embed) とは独立した execute で
-    投げるためメッセージ本体やレポート内容と取り違える余地が無い。
-
-    添付ファイルは「LLM がなぜそう答えたか」を後追い検証するためのもので、
-    Bedrock 呼び出しに使った system / user 文字列と完全一致する。
-    """
-    parts = [
-        "============================================================",
-        "COMPLETE PROMPT SENT TO BEDROCK",
-        "============================================================",
-        "This file contains the exact system prompt and user prompt that",
-        "the Reporter Lambda sent to Amazon Bedrock for analysis. Use this",
-        "to debug why the LLM said what it said in the Discord embed",
-        "report (in the accompanying notification message).",
-        "",
-        f"# Alarm: {alarm_name}",
-        "",
-        "============================================================",
-        "SYSTEM PROMPT",
-        "============================================================",
-        system_prompt.strip(),
-        "",
-        "============================================================",
-        "USER PROMPT",
-        "============================================================",
-        user_text.strip(),
-    ]
-    body = "\n".join(parts) + "\n"
-
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in alarm_name)
-    filename = f"{safe_name}-prompt.txt"
-
-    webhook = DiscordWebhook(
-        url=webhook_url,
-        content="Complete prompt sent to Bedrock (verification attachment)",
-    )
-    webhook.add_file(file=body.encode("utf-8"), filename=filename)
-    webhook.execute()
-
-
-def _post_minimal_embed(
-    webhook_url: str,
-    environment_name: str,
-    target_function_name: str,
-    alarm_name: str,
-    timestamp: str,
-    reason: str,
-    rows_count: int,
-    extra_note: str,
-    color: int,
-) -> None:
-    """
-    LLM 分析なしでコア情報だけ Discord に通知する fallback / no-logs 共通経路。
-
-    ``report-content-by-case`` DRAFT §4.5 の「LLM 失敗時は機械抽出のコア情報だけで
-    通知を成立させる」を最小実装。空ログ早期 return と Bedrock 失敗 fallback の
-    両方から呼ばれる。
-
-    main 5W1H embed と同じ author / field レイアウト原則に揃え、絵文字を排して
-    color で severity を表現する。
-    """
-    webhook = DiscordWebhook(url=webhook_url)
-    embed = DiscordEmbed(title=extra_note[:256], color=color)
-    embed.set_author(name=f"HDW Notify · {environment_name}")
-
-    # 識別子 (Lambda / Alarm / 件数) を main 5W1H embed と同じ並びで inline 表示
-    embed.add_embed_field(name="監視対象 Lambda", value=target_function_name, inline=True)
-    embed.add_embed_field(name="発火 Alarm", value=alarm_name, inline=True)
-    embed.add_embed_field(name="件数", value=f"{rows_count} 件", inline=True)
-
-    embed.add_embed_field(name="Alarm reason", value=reason or "(none)", inline=False)
-    embed.set_timestamp(timestamp)
-    webhook.add_embed(embed)
-    webhook.execute()
-
-
 @logger.inject_lambda_context(log_event=True)
 def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     """
@@ -559,7 +569,6 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         sts_response = boto3.client("sts").assume_role(
             RoleArn=env.cross_account_role_arn,
             RoleSessionName=f"hdw-notify-{_context.aws_request_id}",
-            ExternalId=env.external_id,
             DurationSeconds=900,
         )
         creds = sts_response["Credentials"]
@@ -645,24 +654,14 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         extra={"status": query_result["status"], "rows": len(log_rows)},
     )
 
-    # --- 空ログなら Bedrock を呼ばずに最小通知して終了 ---
-    if not log_rows:
-        _post_minimal_embed(
-            webhook_url=env.discord_webhook_url,
-            environment_name=env.environment_name,
-            target_function_name=env.target_function_name,
-            alarm_name=alarm_name,
-            timestamp=timestamp,
-            reason=reason,
-            rows_count=0,
-            extra_note=f"直近 5 時間 30 分に ship_name={ship_name} の実行ログがありません",
-            color=0x95A5A6,  # gray
-        )
-        logger.info("skipped bedrock; no ship logs")
-        return {"ok": True, "alarm": alarm_name, "severity": "INFO", "skipped": "no_logs"}
+    # --- error_id を確定し、description を Bedrock プロンプトに注入する準備 ---
+    error_id: str = _resolve_error_id(alarm_name, log_rows)
+    profiles = _load_error_profiles()
+    error_description: str = profiles.get(error_id, {}).get("description", "")
+    logger.info("error_id resolved", extra={"error_id": error_id})
 
     # --- Bedrock prompt を構築 (Bedrock 呼び出しと Discord 添付で同一文字列を共有) ---
-    system_prompt: str = render_prompt_system_base(*render_prompt_case_lambda_failure())
+    system_prompt: str = build_system_prompt(error_id, error_description)
     formatted_logs: str = _format_log_rows_pretty(log_rows)
     user_text: str = render_prompt_user(alarm_name, timestamp, reason, formatted_logs, len(log_rows))
 
@@ -716,58 +715,19 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         )
         return {"ok": True, "alarm": alarm_name, "severity": "MEDIUM", "fallback": True}
 
-    # --- Discord 通知投稿 (Discord embed 4 階層レイアウト: author / title / fields / footer) ---
-    # title は LLM summary を昇格 (人間が最初に読むべき情報)。
-    # 監視対象 Lambda 名と発火 Alarm 名は inline field でラベル付き横並びにして
-    # 「2 つの似た文字列」を視覚的に分離する。color が severity の唯一のシグナル。
-    webhook = DiscordWebhook(url=env.discord_webhook_url)
-    embed = DiscordEmbed(
-        title=report["summary"][:256],
-        color=DISCORD_SEVERITY_COLOR.get(report["severity"], 0x95A5A6),
+    # --- Message 構築と全チャネルへのディスパッチ ---
+    message = Message(
+        title=report["summary"],
+        severity=report["severity"],
+        confidence=report["confidence"],
+        root_cause=report["root_cause_hypothesis"],
+        actions=report.get("suggested_actions") or [],
+        alarm_name=alarm_name,
+        ship_name=ship_name,
+        timestamp=center,
     )
-    embed.set_author(name=f"HDW Notify · {env.environment_name}")
-
-    # 識別子 3 つを inline で横並び (PC で 3 列、モバイルで縦積みでもラベルで判別可)
-    embed.add_embed_field(name="監視対象 Lambda", value=env.target_function_name, inline=True)
-    embed.add_embed_field(name="発火 Alarm", value=alarm_name, inline=True)
-    embed.add_embed_field(name="件数", value=f"{len(log_rows)} 件", inline=True)
-
-    # 数値メタ (集計時間窓は phrase 性質のため 1 行を専有させる)
-    embed.add_embed_field(
-        name="集計時間窓", value=_format_window_jst(start, end), inline=False
-    )
-
-    # LLM 解釈 (Why) — confidence を field 名に併記
-    confidence = report.get("confidence", "low")
-    embed.add_embed_field(
-        name=f"原因仮説 (confidence: {confidence})",
-        value=report.get("root_cause_hypothesis", "(不明)"),
-        inline=False,
-    )
-
-    # LLM 解釈 (How) — AWS-level / コード修正レベルのアクション
-    actions = report.get("suggested_actions") or []
-    if actions:
-        embed.add_embed_field(
-            name="推奨アクション",
-            value="\n".join(f"- {a}" for a in actions),
-            inline=False,
-        )
-
-    # 機械事実 (How: 深掘り動線)
-    embed.add_embed_field(
-        name="詳細リンク",
-        value=_build_deeplinks_markdown(env, log_group, client_region, start, end),
-        inline=False,
-    )
-
-    # footer: 代表 request_id (絶対時刻は timestamp で Discord がクライアントローカル表示)
-    representative_request_id = _extract_first_request_id(log_rows) or "(なし)"
-    embed.set_footer(text=f"req-id: {representative_request_id}")
-    embed.set_timestamp(timestamp)
-    webhook.add_embed(embed)
-    webhook.execute()  # Discord に Embed を POST
-    logger.info("discord notified")
+    _dispatch(alarm_name, message, error_id, env)
+    logger.info("dispatch complete", extra={"error_id": error_id})
 
     return {
         "ok": True,

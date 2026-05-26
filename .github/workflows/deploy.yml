@@ -17,7 +17,6 @@ jobs:
   deploy:
     name: Build image & update Lambda
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
       - name: Checkout
@@ -47,8 +46,8 @@ jobs:
           provenance: false
           platforms: linux/amd64
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ vars.AWS_ECR_REPOSITORY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -58,8 +57,8 @@ jobs:
         # 旧コードが読みに行って KeyError を踏むリスクを避ける (新コードは古い env
         # キーを参照しないため、新コード + 旧 env の組合せは安全)。
         env:
-          FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
-          IMAGE_URI: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          FUNCTION_NAME: ${{ vars.AWS_LAMBDA_FUNCTION_NAME }}
+          IMAGE_URI: ${{ steps.ecr-login.outputs.registry }}/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}
         run: |
           set -euo pipefail
           aws lambda update-function-code \
@@ -80,17 +79,13 @@ jobs:
         # 同梱で起動時に PyYAML で読まれる) ため、ここでは env vars に投入しない。
         # ubuntu-latest runner には yq (mikefarah/yq v4) と jq がプリインストール済み。
         env:
-          FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+          FUNCTION_NAME: ${{ vars.AWS_LAMBDA_FUNCTION_NAME }}
           CONFIG_FILE: deploy/config.yml
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # cross-account-architecture: クライアント側 Trust Policy の sts:ExternalId
-          # 条件と一致させる必要がある機密値。
-          EXTERNAL_ID: ${{ secrets.EXTERNAL_ID_HANSHIN }}
         run: |
           set -euo pipefail
 
           : "${DISCORD_WEBHOOK_URL:?secret DISCORD_WEBHOOK_URL is required}"
-          : "${EXTERNAL_ID:?secret EXTERNAL_ID_HANSHIN is required}"
           test -f "$CONFIG_FILE" || { echo "config file not found: $CONFIG_FILE" >&2; exit 1; }
 
           echo "Source config: $CONFIG_FILE"
@@ -103,10 +98,8 @@ jobs:
           ENV_JSON=$(jq -n \
             --argjson c "$CONFIG_JSON" \
             --arg DISCORD_WEBHOOK_URL "$DISCORD_WEBHOOK_URL" \
-            --arg EXTERNAL_ID "$EXTERNAL_ID" \
             '{Variables: {
               DISCORD_WEBHOOK_URL: $DISCORD_WEBHOOK_URL,
-              EXTERNAL_ID: $EXTERNAL_ID,
               ENVIRONMENT_NAME: ($c.environment_name | tostring),
               TARGET_FUNCTION_NAME: ($c.target_function_name | tostring),
               CROSS_ACCOUNT_ROLE_ARN: ($c.aws_cross_account_role_arn | tostring),

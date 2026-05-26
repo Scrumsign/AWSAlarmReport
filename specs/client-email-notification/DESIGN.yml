@@ -1,0 +1,10 @@
+id: client-email-notification
+spec_version: 0.1.0
+rev: 1
+open_decisions:
+  - id: O-1
+    title: メールサービスの選定
+    current_lean: Amazon SES（DNS 管理権限確認後に確定）
+  - id: O-2
+    title: 送信元アドレス
+    current_lean: alerts@scrumsign.com（SES ドメイン設定後に確定）

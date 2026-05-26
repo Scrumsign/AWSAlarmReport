@@ -1,0 +1,811 @@
+test:
+  spec:
+    id: "bedrock-prompt-generalization"
+    version: "0.5.0"
+  plan_rev: 5
+  rev: 6
+  created_at: "2026-05-22"
+
+  # =============================================================================
+  # 方針
+  # =============================================================================
+  # 本 TEST は重要な振る舞いを検証するテストに絞る。PLAN の実装で自明な箇所
+  # (dataclass フィールドと YAML キーの 1:1 対応、関数の戻り値型の宣言一致等) は
+  # 省略する。代わりに以下を重点的にカバー:
+  #
+  #   1. profile スキーマの整合性制約検証 (REQ-002)
+  #   2. "-test" 正規化の横断動作 (REQ-004 / REQ-005 / REQ-016)
+  #   3. 後方互換削除の静的確認 (REQ-011 / REQ-012 / REQ-013)
+  #   4. システムプロンプト内容の禁則/必須語検査 (REQ-001)
+  #   5. severity 補正のポリシー強制 (REQ-009)
+  #   6. Bedrock 応答正規化の安全網 (REQ-007)
+  #   7. フォールバック 2 系統の通知保証と区別 (REQ-008)
+  #   8. webhook 解決の fail-fast / 例外回避 (REQ-016)
+  #   9. オーケストレーター E2E (TASK-013 統合)
+  #
+  # 省略するもの:
+  #   - load_config が Config dataclass を返すこと (型システムが保証)
+  #   - normalize_alarm_name("foo") が "foo" を返す (恒等変換、自明)
+  #   - dataclass のフィールド名 YAML キーと 1:1 対応 (load_config 実装で自明)
+  #   - 各 enum 値の個別検証 (1 つの enum 違反テストで代表)
+  #
+  # テストランナー: pytest を前提
+  # type 分類: unit / integration / e2e / static
+  # =============================================================================
+
+  fixtures:
+    valid_profile: |
+      # tests/conftest.py
+      @pytest.fixture
+      def valid_profile():
+          \"\"\"SPEC 規範どおりの最小有効 profile (PLAN 例 1 相当)。\"\"\"
+          return {
+              "function_name": "HDW_Backend_Processor_0001",
+              "signal_kind": [
+                  {
+                      "name": "completion_success",
+                      "type": "verdict",
+                      "mechanism": "log_marker",
+                      "locator": "event=lambda_complete の status",
+                      "success_condition": "status == success",
+                      "failure_condition": "status == error or traceback",
+                      "absence_hypothesis": "S3 ZIP 未着",
+                      "max_severity_on_success": "MEDIUM",
+                      "severity_on_absence": "MEDIUM",
+                  },
+                  {
+                      "name": "ng_file",
+                      "type": "ignored",
+                      "mechanism": "log_marker",
+                      "locator": "message に NG file",
+                      "description": "設計上の許容分岐",
+                  },
+              ],
+              "signal": [{"name": "hdw-sakura", "kind": "completion_success"}],
+              "input_identifiers": ["ship_name", "ship_timestamp"],
+          }
+
+  cases:
+
+    # ============================================================
+    # TC-002: profile スキーマ整合性検証 (REQ-002)
+    # ============================================================
+
+    - id: "TC-002-1"
+      ac: "AC-002-3"
+      type: unit
+      importance: 高
+      title: "signal[].kind が signal_kind[].name に存在しない (整合性制約 #4)"
+      reason: |
+        設定ミスで存在しない kind を指した場合に静かに失敗するのを防ぐ。
+        fallback パスが発火する前段で検出。
+      code: |
+        # tests/test_profile.py
+        import pytest
+        from utils.profile import validate_profile, ProfileSchemaError
+
+
+        def test_signal_kind_dangling_reference(valid_profile):
+            valid_profile["signal"][0]["kind"] = "nonexistent_kind"
+            with pytest.raises(ProfileSchemaError, match=r"not in signal_kind"):
+                validate_profile(valid_profile)
+
+    - id: "TC-002-2"
+      ac: "AC-002-3"
+      type: unit
+      importance: 高
+      title: "signal[].kind が ignored を指す (整合性制約 #5)"
+      reason: |
+        ignored は障害判定に使わない設計。誤って指された場合は意味不明な
+        動作になるため必須検出。
+      code: |
+        def test_signal_points_to_ignored(valid_profile):
+            valid_profile["signal"][0]["kind"] = "ng_file"
+            with pytest.raises(ProfileSchemaError, match=r"not type=verdict"):
+                validate_profile(valid_profile)
+
+    - id: "TC-002-3"
+      ac: "AC-002-4"
+      type: unit
+      importance: 高
+      title: "signal[].name に -test 末尾混入 (整合性制約 #3 / -test 不変条件)"
+      reason: |
+        -test 統合不変条件 (SPEC 全域に効く) の検出点。混入を許すと test alarm
+        が独立 entry を持つ二重管理状態になる。
+      code: |
+        def test_signal_name_with_test_suffix(valid_profile):
+            valid_profile["signal"][0]["name"] = "hdw-sakura-test"
+            with pytest.raises(ProfileSchemaError, match=r"ends with '-test'"):
+                validate_profile(valid_profile)
+
+    - id: "TC-002-4"
+      ac: "AC-002-1"
+      type: unit
+      importance: 中
+      title: "type=verdict で severity フィールド欠落 (整合性制約 #6)"
+      reason: |
+        本仕様で原文より厳格にした制約。欠落で fallback_generic を意図せず
+        適用してしまう事故を防ぐ (REQ-009 で severity 補正が signal_kind 由来の
+        ためフィールド欠落=未定義動作を避けたい)。
+      code: |
+        @pytest.mark.parametrize("missing_field", [
+            "max_severity_on_success",
+            "severity_on_absence",
+        ])
+        def test_verdict_missing_severity_field(valid_profile, missing_field):
+            del valid_profile["signal_kind"][0][missing_field]
+            with pytest.raises(ProfileSchemaError, match=missing_field):
+                validate_profile(valid_profile)
+
+    - id: "TC-002-5"
+      ac: "AC-002-2"
+      type: unit
+      importance: 中
+      title: "enum 値違反 (1 ケースで代表)"
+      reason: |
+        個別 enum (type / mechanism / severity) の違反検出が動くこと。
+        実装が同じパターンを使うため 1 つで代表検証。
+      code: |
+        def test_invalid_type_enum(valid_profile):
+            valid_profile["signal_kind"][0]["type"] = "unknown_role"
+            with pytest.raises(ProfileSchemaError, match=r"type="):
+                validate_profile(valid_profile)
+
+    # ============================================================
+    # TC-NORM: -test 正規化の横断動作 (REQ-004 / REQ-005 / REQ-016)
+    # ============================================================
+
+    - id: "TC-NORM-1"
+      ac: "AC-004-2, AC-015-1"
+      type: unit
+      importance: 高
+      title: "prod / test 名で同一 Config を解決"
+      reason: |
+        configs/ レイヤの正規化が機能することの単一証拠。
+      code: |
+        def test_load_config_normalization(tmp_path, monkeypatch):
+            configs = tmp_path / "configs"
+            configs.mkdir()
+            (configs / "hdw-sakura.yaml").write_text(\"\"\"
+        function_name: F
+        account_id: "123"
+        aws_region: ap-northeast-1
+        assume_role_arn: arn:aws:iam::123:role/R
+        log_group: /aws/lambda/F
+        profile_location: s3://bucket/profile.yaml
+        bedrock_model_id: model-id
+        bedrock_max_tokens: 2000
+        cloudwatch_logs_query_poll_interval_sec: 2.0
+        \"\"\")
+            monkeypatch.setenv("LAMBDA_TASK_ROOT", str(tmp_path))
+            from utils.config import load_config
+            assert load_config("hdw-sakura") == load_config("hdw-sakura-test")
+
+    - id: "TC-NORM-2"
+      ac: "AC-005-3"
+      type: unit
+      importance: 高
+      title: "signal_kind 解決が正規化後 alarm 名で行われる"
+      reason: |
+        profile.signal[] のキーが正規化前提であり、test alarm が独立 entry
+        なしで動くことを担保。
+      code: |
+        # tests/test_signal.py
+        from utils.signal import resolve_signal_kind
+
+
+        def test_resolve_normalization(valid_profile):
+            prod = resolve_signal_kind("hdw-sakura", valid_profile)
+            test = resolve_signal_kind("hdw-sakura-test", valid_profile)
+            assert prod is test
+
+    - id: "TC-NORM-3"
+      ac: "AC-016-2"
+      type: unit
+      importance: 高
+      title: "webhook 解決が正規化後 alarm 名で行われる"
+      reason: |
+        webhook 配信先の正規化動作。test/prod が別チャンネルにならない
+        (本仕様の意図的な選択) ことを確認。
+      code: |
+        # tests/test_webhooks.py
+        import json
+        import sys
+
+
+        def test_webhook_normalization(monkeypatch):
+            monkeypatch.setenv("DISCORD_WEBHOOK_URLS", json.dumps({
+                "hdw-sakura": "https://discord.com/api/webhooks/A",
+            }))
+            sys.modules.pop("utils.webhooks", None)
+            from utils.webhooks import resolve_webhook_url
+            assert resolve_webhook_url("hdw-sakura") == "https://discord.com/api/webhooks/A"
+            assert resolve_webhook_url("hdw-sakura-test") == "https://discord.com/api/webhooks/A"
+
+    # ============================================================
+    # TC-CLEANUP: 後方互換削除の静的確認 (REQ-011 / REQ-012 / REQ-013)
+    # ============================================================
+
+    - id: "TC-CLEANUP-1"
+      ac: "AC-011-1"
+      type: static
+      importance: 高
+      title: "ケース分岐コード完全削除 (REQ-011)"
+      reason: |
+        既存ケース分岐は本仕様の「特定 Lambda 専用 → 汎用」の核心転換。
+        残置すると新メタ手続きと旧分岐が並存し意味不明な挙動になる。
+      code: |
+        # tests/static/test_no_case_branching.sh
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        FORBIDDEN=(
+          "render_prompt_case_no_logs"
+          "render_prompt_case_lambda_failure"
+          "case_specific_instructions"
+          "_SYSTEM_PROMPT_TEMPLATE"
+          "render_prompt_system_base"
+        )
+        for token in "${FORBIDDEN[@]}"; do
+          if grep -rn "$token" src/; then
+            echo "FAIL: token '$token' still exists in src/"
+            exit 1
+          fi
+        done
+        echo "PASS: all forbidden tokens removed"
+
+    - id: "TC-CLEANUP-2"
+      ac: "AC-012-1"
+      type: static
+      importance: 高
+      title: "旧キー (root_cause_hypothesis / suggested_actions) 削除 (REQ-012)"
+      reason: |
+        REQ-007 の新スキーマと旧スキーマが混在すると Discord embed が誤った
+        経路でデータを引いて壊れる。
+      code: |
+        # tests/static/test_no_old_output_keys.sh
+        for token in "root_cause_hypothesis" "suggested_actions"; do
+          if grep -rn "$token" src/; then
+            echo "FAIL: old key '$token' still referenced"
+            exit 1
+          fi
+        done
+
+    - id: "TC-CLEANUP-3"
+      ac: "AC-013-1, AC-013-3, AC-013-4"
+      type: static
+      importance: 高
+      title: "Env dataclass / 廃止 env var の完全削除 (REQ-013)"
+      reason: |
+        env var 整理が中途半端だと、新フローと旧フローが混在して config 解決
+        が壊れる。GitHub Actions のデプロイ設定も含めて検査。
+      code: |
+        # tests/static/test_env_cleanup.sh
+        if grep -n "class Env" src/main.py; then
+            echo "FAIL: Env dataclass still exists"
+            exit 1
+        fi
+
+        DEPRECATED_ENV=(
+          "CROSS_ACCOUNT_ROLE_ARN"
+          "TARGET_FUNCTION_NAME"
+          "BEDROCK_MODEL_ID"
+          "BEDROCK_MAX_TOKENS"
+          "CLOUDWATCH_LOGS_QUERY_POLL_INTERVAL_SEC"
+          "ENVIRONMENT_NAME"
+          "LOG_GROUP_MAP"
+        )
+        for var in "${DEPRECATED_ENV[@]}"; do
+          if grep -rn "$var" src/ .github/workflows/; then
+            echo "FAIL: deprecated env var '$var' still referenced"
+            exit 1
+          fi
+        done
+
+        if grep -rn "DISCORD_WEBHOOK_URL[^S]" src/ .github/workflows/; then
+            echo "FAIL: bare DISCORD_WEBHOOK_URL still referenced"
+            exit 1
+        fi
+
+    # ============================================================
+    # TC-PROMPT: システムプロンプト内容 (REQ-001)
+    # ============================================================
+
+    - id: "TC-PROMPT-1"
+      ac: "AC-001-1"
+      type: static
+      importance: 高
+      title: "監視対象固有語彙の禁止"
+      reason: |
+        「特定 Lambda 専用 → 汎用」の核心要件。1 語でも残れば本仕様の意義が
+        崩れる。
+      code: |
+        # tests/test_prompt_content.py
+        import pytest
+        from utils.prompt import STATIC_SYSTEM_PROMPT
+
+
+        FORBIDDEN_TOKENS = [
+            "HDW_Backend_Processor_0001",
+            "ship_name",
+            "ship_timestamp",
+            "input_key",
+            "lambda_complete",
+            "NG file",
+            "pia_data",
+            "csv parse failed",
+        ]
+
+
+        @pytest.mark.parametrize("token", FORBIDDEN_TOKENS)
+        def test_no_target_specific_vocabulary(token):
+            assert token not in STATIC_SYSTEM_PROMPT, (
+                f"forbidden token {token!r} leaked into STATIC_SYSTEM_PROMPT"
+            )
+
+    - id: "TC-PROMPT-2"
+      ac: "AC-001-2"
+      type: static
+      importance: 高
+      title: "必須要素 (b1-b4 / severity 規約 / 字数制限) の包含"
+      reason: |
+        メタ手続き / failure_taxonomy / 字数制限がプロンプトに含まれていないと、
+        Bedrock の出力が本仕様の規約から外れる。
+      code: |
+        REQUIRED_PHRASES = [
+            "b1", "b2", "b3", "b4",
+            "コードバグ", "入力データ異常", "設定欠落", "外部依存障害",
+            "healthy", "failed", "absent",
+            "HIGH", "MEDIUM", "LOW",
+            "<=80", "<=300",
+            "即時対応", "調査手順", "恒久対策",
+        ]
+
+
+        @pytest.mark.parametrize("phrase", REQUIRED_PHRASES)
+        def test_required_phrases_present(phrase):
+            assert phrase in STATIC_SYSTEM_PROMPT, (
+                f"required phrase {phrase!r} missing from STATIC_SYSTEM_PROMPT"
+            )
+
+    # ============================================================
+    # TC-SEV: severity 補正 (REQ-009)
+    # ============================================================
+
+    - id: "TC-SEV-1"
+      ac: "AC-009-1"
+      type: unit
+      importance: 高
+      title: "healthy で max_severity_on_success に clamp"
+      reason: |
+        Bedrock が "HIGH" を返したケースで運用ポリシー (healthy 最大 MEDIUM)
+        が貫徹されること。一方で正しい LOW は不変であること (clamp 関数の
+        境界条件)。
+      code: |
+        # tests/test_response.py
+        from utils.response import apply_severity_policy
+
+
+        def test_healthy_clamps_high_to_medium():
+            response = {
+                "verdict": "healthy", "severity": "HIGH",
+                "confidence": "high", "summary": "...",
+                "detail": "...", "actions": [],
+            }
+            signal_kind = {"max_severity_on_success": "MEDIUM",
+                           "severity_on_absence": "MEDIUM"}
+            out = apply_severity_policy(response, signal_kind)
+            assert out["severity"] == "MEDIUM"
+
+
+        def test_healthy_low_stays_low():
+            response = {"verdict": "healthy", "severity": "LOW",
+                        "confidence": "high", "summary": "", "detail": "", "actions": []}
+            signal_kind = {"max_severity_on_success": "MEDIUM",
+                           "severity_on_absence": "MEDIUM"}
+            assert apply_severity_policy(response, signal_kind)["severity"] == "LOW"
+
+    - id: "TC-SEV-2"
+      ac: "AC-009-2"
+      type: unit
+      importance: 高
+      title: "absent で severity_on_absence + confidence=low に上書き"
+      reason: |
+        absent 時の confidence=low はメタ手続きの既定値 (REQ-001 / 原文 2.)。
+        LLM が "high" と返しても low に揃える保証。
+      code: |
+        def test_absent_overwrites_severity_and_confidence():
+            response = {"verdict": "absent", "severity": "LOW",
+                        "confidence": "high", "summary": "", "detail": "", "actions": []}
+            signal_kind = {"max_severity_on_success": "MEDIUM",
+                           "severity_on_absence": "MEDIUM"}
+            out = apply_severity_policy(response, signal_kind)
+            assert out["severity"] == "MEDIUM"
+            assert out["confidence"] == "low"
+
+    - id: "TC-SEV-3"
+      ac: "AC-009-3"
+      type: unit
+      importance: 中
+      title: "failed で補正なし"
+      reason: |
+        failed は固定 HIGH (REQ-009)。max_severity_on_success の影響を受けない
+        (= verdict 別の補正ロジックが正しく分岐していること)。
+      code: |
+        def test_failed_no_correction():
+            response = {"verdict": "failed", "severity": "HIGH",
+                        "confidence": "high", "summary": "", "detail": "", "actions": []}
+            signal_kind = {"max_severity_on_success": "LOW",
+                           "severity_on_absence": "MEDIUM"}
+            out = apply_severity_policy(response, signal_kind)
+            assert out["severity"] == "HIGH"
+
+    # ============================================================
+    # TC-NORMRESP: Bedrock 応答正規化 (REQ-007)
+    # ============================================================
+
+    - id: "TC-NORMRESP-1"
+      ac: "AC-007-2"
+      type: unit
+      importance: 高
+      title: "字数制限 truncate (summary <=80 / detail <=300 / actions[].text <=80)"
+      reason: |
+        字数制限はシステムプロンプトに書いているが Bedrock が守るとは限らない
+        (REQ-007 の二重防御原則)。
+      code: |
+        # tests/test_response.py
+        import json
+        from utils.response import normalize_bedrock_response
+
+
+        def test_truncates_oversize_fields():
+            raw = json.dumps({
+                "verdict": "failed", "severity": "HIGH", "confidence": "high",
+                "summary": "x" * 200,
+                "detail": "y" * 1000,
+                "actions": [{"phase": "即時対応", "text": "z" * 200}],
+            })
+            out = normalize_bedrock_response(raw)
+            assert len(out["summary"]) == 80
+            assert len(out["detail"]) == 300
+            assert len(out["actions"][0]["text"]) == 80
+
+    - id: "TC-NORMRESP-2"
+      ac: "AC-007-1, AC-007-2"
+      type: unit
+      importance: 高
+      title: "不正 JSON で安全既定値を返し例外を投げない"
+      reason: |
+        Bedrock 応答が壊れたケースでも main 側に例外を投げず、後続のレポート
+        組み立てを継続できること。
+      code: |
+        def test_invalid_json_returns_safe_defaults():
+            out = normalize_bedrock_response("{this is not json")
+            assert out["verdict"] == "absent"
+            assert out["severity"] == "MEDIUM"
+            assert out["confidence"] == "low"
+            assert "取得失敗" in out["summary"]
+
+    - id: "TC-NORMRESP-3"
+      ac: "AC-007-3"
+      type: unit
+      importance: 中
+      title: "actions の phase enum 違反でスキップ (有効要素は通す)"
+      reason: |
+        不正な phase が混入しても全 actions を破棄せず、有効な要素だけを通す
+        こと。
+      code: |
+        def test_invalid_phase_skipped():
+            raw = json.dumps({
+                "verdict": "failed", "severity": "HIGH", "confidence": "high",
+                "summary": "s", "detail": "d",
+                "actions": [
+                    {"phase": "即時対応", "text": "ok"},
+                    {"phase": "unknown", "text": "skip me"},
+                    {"phase": "恒久対策", "text": ""},
+                ],
+            })
+            out = normalize_bedrock_response(raw)
+            assert len(out["actions"]) == 1
+            assert out["actions"][0]["phase"] == "即時対応"
+
+    # ============================================================
+    # TC-FALLBACK: 2 系統フォールバック (REQ-008)
+    # ============================================================
+
+    - id: "TC-FALLBACK-1"
+      ac: "AC-008-1"
+      type: integration
+      importance: 高
+      title: "(a) configs/<alarm>.yaml 不在で profile_missing 印付き通知"
+      reason: |
+        「config 不在で Lambda 落ち = 通知欠落」を防ぐ生存保証。fallback 種別の
+        印 ("profile_missing") が後段で識別可能であること。
+      code: |
+        # tests/test_fallback.py
+        import json
+        import pytest
+        from unittest.mock import patch, MagicMock
+
+
+        @pytest.fixture
+        def mock_sns_event():
+            def _make(alarm_name: str) -> dict:
+                return {"Records": [{"Sns": {"Message": json.dumps({
+                    "AlarmName": alarm_name,
+                    "AlarmDescription": "test alarm",
+                    "StateChangeTime": "2026-05-22T14:30:00.000+0000",
+                })}}]}
+            return _make
+
+
+        def test_fallback_a_config_not_found(mock_sns_event, tmp_path, monkeypatch):
+            monkeypatch.setenv("LAMBDA_TASK_ROOT", str(tmp_path))
+            monkeypatch.setenv("DISCORD_WEBHOOK_URLS", json.dumps({
+                "hdw-unknown": "https://discord.example/webhook",
+            }))
+            (tmp_path / "configs").mkdir()
+
+            with patch("discord_webhook.DiscordWebhook.execute") as mock_execute, \
+                 patch("discord_webhook.DiscordWebhook.add_embed"):
+                from main import main
+                result = main(
+                    mock_sns_event("hdw-unknown"),
+                    MagicMock(aws_request_id="t-1"),
+                )
+
+            assert result["fallback"] == "profile_missing"
+            mock_execute.assert_called_once()
+
+    - id: "TC-FALLBACK-2"
+      ac: "AC-008-1"
+      type: integration
+      importance: 高
+      title: "(a) profile YAML 取得失敗で profile_missing 印"
+      reason: |
+        S3 一時障害や IAM 設定漏れで profile が引けないケースの生存保証。
+      code: |
+        def test_fallback_a_profile_s3_failure(...):
+            \"\"\"S3 GetObject が ClientError を投げるケース。
+            configs/hdw-sakura.yaml は存在するが profile S3 取得が失敗するよう
+            モック → result["fallback"] == "profile_missing"
+            → ProfileSchemaError 統一例外として処理されること。
+            \"\"\"
+            # patch boto3.client("s3").get_object でClientError を raise
+            # main(event, context) が正常 return すること
+            # result["fallback"] == "profile_missing"
+
+    - id: "TC-FALLBACK-3"
+      ac: "AC-008-2"
+      type: integration
+      importance: 高
+      title: "(b) profile.signal[] に該当 alarm 名なしで signal_unresolved 印"
+      reason: |
+        (a) と (b) を異なる印で区別することが REQ-008 AC-008-2 の中核要件。
+        運用者が原因切り分けできる。
+      code: |
+        def test_fallback_b_signal_unresolved(mock_sns_event, ...):
+            \"\"\"profile は取れたが signal[] に該当 alarm 名が無いケース。\"\"\"
+            # profile.signal = [{"name": "hdw-other", "kind": "..."}]
+            # alarm "hdw-sakura" を投入 → resolve_signal_kind が
+            # SignalUnresolvedError → main は FALLBACK_GENERIC 採用
+            # fallback_kind="signal_unresolved"
+            # Discord embed footer に "fallback: signal_unresolved" が含まれること
+            assert result["fallback"] == "signal_unresolved"
+
+    - id: "TC-FALLBACK-4"
+      ac: "AC-008-1, AC-008-2"
+      type: static
+      importance: 中
+      title: "fallback 種別の文字列が衝突しない"
+      reason: |
+        識別子が衝突すると運用者が「どこで失敗したか」を切り分けられない。
+      code: |
+        def test_fallback_kinds_are_distinguishable():
+            \"\"\"fallback_kind 文字列が衝突しないこと。\"\"\"
+            # main.py で使われる識別子集合
+            KINDS = {
+                "profile_missing",
+                "signal_unresolved",
+                "assume_role_failed",
+                "bedrock_failed",
+            }
+            assert len(KINDS) == len(set(KINDS))
+            assert all(k for k in KINDS)
+
+    # ============================================================
+    # TC-WEBHOOK: DISCORD_WEBHOOK_URLS (REQ-016)
+    # ============================================================
+
+    - id: "TC-WEBHOOK-1"
+      ac: "AC-016-1"
+      type: unit
+      importance: 高
+      title: "不正 JSON で cold start fail-fast"
+      reason: |
+        不正 JSON が silent failure (アラーム受信ごとに気付かず通知欠落) になる
+        のを防ぐ。cold start で明確に失敗させることで早期検知。
+      code: |
+        # tests/test_webhooks.py
+        import pytest
+        import sys
+
+
+        def test_invalid_json_fails_at_module_load(monkeypatch):
+            monkeypatch.setenv("DISCORD_WEBHOOK_URLS", "this is not json")
+            sys.modules.pop("utils.webhooks", None)
+            from utils.webhooks import WebhookConfigError
+            with pytest.raises(WebhookConfigError, match="valid JSON"):
+                sys.modules.pop("utils.webhooks", None)
+                import utils.webhooks  # noqa: F401
+
+    - id: "TC-WEBHOOK-2"
+      ac: "AC-016-3"
+      type: integration
+      importance: 高
+      title: "該当キー不在で None + Lambda 正常終了"
+      reason: |
+        webhook 登録漏れで Lambda 全体が落ちず、CloudWatch Logs で気付ける状態
+        にする。
+      code: |
+        def test_missing_key_returns_none_no_exception(monkeypatch):
+            import json, sys
+            monkeypatch.setenv("DISCORD_WEBHOOK_URLS",
+                               json.dumps({"hdw-other": "..."}))
+            sys.modules.pop("utils.webhooks", None)
+            from utils.webhooks import resolve_webhook_url
+            assert resolve_webhook_url("hdw-sakura") is None
+            # main 側はこれを受けて Discord 投稿スキップ + warning ログのみ
+            # (実際の挙動検証は TC-E2E で行う)
+
+    # ============================================================
+    # TC-E2E: オーケストレーター統合 (TASK-013)
+    # ============================================================
+
+    - id: "TC-E2E-1"
+      ac: "ALL"
+      type: integration
+      importance: 高
+      title: "Golden path (SNS → load_config → AssumeRole → profile → signal_kind → Insights → Bedrock → Discord)"
+      reason: |
+        各 TASK の unit test では捕捉できない型・引数の不整合 (例: signal_kind
+        dict のキー欠落、Bedrock 応答の構造変化) を統合的に検出する。
+      code: |
+        # tests/test_orchestrator.py
+        import json
+        from unittest.mock import patch, MagicMock
+
+
+        def test_golden_path_end_to_end(tmp_path, monkeypatch, valid_profile):
+            monkeypatch.setenv("LAMBDA_TASK_ROOT", str(tmp_path))
+            monkeypatch.setenv("DISCORD_WEBHOOK_URLS", json.dumps({
+                "hdw-sakura": "https://discord.example/webhook",
+            }))
+            (tmp_path / "configs").mkdir()
+            (tmp_path / "configs" / "hdw-sakura.yaml").write_text(\"\"\"
+        function_name: HDW_Backend_Processor_0001
+        account_id: "920373030024"
+        aws_region: ap-northeast-1
+        assume_role_arn: arn:aws:iam::920373030024:role/HDWNotifyLogReader
+        log_group: /aws/lambda/HDW_Backend_Processor_0001
+        profile_location: s3://test-bucket/profile.yaml
+        bedrock_model_id: test-model
+        bedrock_max_tokens: 2000
+        cloudwatch_logs_query_poll_interval_sec: 0.1
+        \"\"\")
+
+            bedrock_response_text = json.dumps({
+                "verdict": "failed",
+                "severity": "HIGH",
+                "confidence": "high",
+                "summary": "[処理失敗] traceback あり",
+                "detail": "details",
+                "actions": [
+                    {"phase": "即時対応", "text": "stack_trace を確認"},
+                ],
+            })
+
+            with patch("boto3.client") as mock_boto:
+                sts = MagicMock()
+                sts.assume_role.return_value = {"Credentials": {
+                    "AccessKeyId": "k", "SecretAccessKey": "s", "SessionToken": "t",
+                }}
+                s3 = MagicMock()
+                s3.get_object.return_value = {
+                    "Body": MagicMock(read=MagicMock(return_value=b"yaml bytes"))
+                }
+                logs = MagicMock()
+                logs.start_query.return_value = {"queryId": "q"}
+                logs.get_query_results.return_value = {
+                    "status": "Complete",
+                    "results": [[
+                        {"field": "@timestamp", "value": "2026-05-22T14:25:00.000+0000"},
+                        {"field": "function_request_id", "value": "req-xyz"},
+                        {"field": "@message", "value": '{"level":"ERROR","message":"fail"}'},
+                    ]],
+                }
+                bedrock = MagicMock()
+                bedrock.converse.return_value = {"output": {"message": {
+                    "content": [{"text": bedrock_response_text}]
+                }}}
+
+                def _dispatch(name, **kw):
+                    return {"sts": sts, "s3": s3,
+                            "logs": logs, "bedrock-runtime": bedrock}[name]
+                mock_boto.side_effect = _dispatch
+
+                with patch("utils.profile.yaml.safe_load", return_value=valid_profile), \
+                     patch("discord_webhook.DiscordWebhook.execute") as mock_post:
+                    from main import main
+                    event = {"Records": [{"Sns": {"Message": json.dumps({
+                        "AlarmName": "hdw-sakura",
+                        "AlarmDescription": "test",
+                        "StateChangeTime": "2026-05-22T14:30:00.000+0000",
+                    })}}]}
+                    result = main(event, MagicMock(aws_request_id="t-1"))
+
+            assert result["ok"] is True
+            assert result["verdict"] == "failed"
+            assert result["severity"] == "HIGH"
+            assert result["fallback"] is None
+            mock_post.assert_called_once()
+
+    - id: "TC-E2E-2"
+      ac: "ALL (-test 統合不変条件 + TC-NORM-* の統合)"
+      type: integration
+      importance: 高
+      title: "hdw-sakura-test alarm で prod と同じ profile / webhook が引かれる"
+      reason: |
+        -test 統合不変条件の E2E 検証。横断テスト (TC-NORM-1〜3) が個別レイヤ
+        で動いても、main フロー全体で破綻しないこと。
+      code: |
+        def test_test_alarm_uses_same_resources_as_prod(...):
+            \"\"\"hdw-sakura-test を投げて、prod 用の config / webhook が
+            使われること。
+            検証ポイント:
+              - load_config が hdw-sakura.yaml を引いていること
+              - profile.signal の completion_success が解決されていること
+              - DISCORD_WEBHOOK_URLS の "hdw-sakura" キーから URL が引かれていること
+              - Discord embed の author が "HDW Notify · test" (derive_env_label)
+            \"\"\"
+            # TC-E2E-1 と同じ fixture で alarm_name="hdw-sakura-test" を投入
+            # mock_post.call_args から embed を取り出し、author が "test" 付き
+
+  # ============================================================
+  # 省略するテスト (記録)
+  # ============================================================
+  # PLAN の実装で自明か、上記テストで間接的にカバーされるため省略:
+  #
+  #   - Config dataclass のフィールド名が YAML キーと 1:1
+  #     → load_config 実装で機械的に行うため自明
+  #   - normalize_alarm_name("foo") が "foo" を返す
+  #     → 恒等変換の自明動作。TC-NORM で "-test" 含むケースのみ検証
+  #   - build_insights_query が空でない文字列を返す
+  #     → 実装で自明。空 input_identifiers エラーケースのみ間接検証
+  #   - Insights クエリ文字列の細部 (fields 句の順序等)
+  #     → スコープ外 (REQ-006 description)
+  #   - Discord embed の各 field の細部
+  #     → TASK-010 で機械的に組み立てるため自明。TC-E2E で投稿発火のみ検証
+  #   - derive_env_label の単独 unit test
+  #     → TC-E2E-2 の embed author 表記検証で間接的にカバー
+  #   - extract_ignored_signals の単独 unit test
+  #     → profile fixture を渡せば自明な filter。TC-E2E で間接検証
+  #   - 各 enum 値の個別検証 (type / mechanism / severity)
+  #     → 1 つの enum 違反テスト (TC-002-5) で代表
+  #   - 各 REQ ごとの AC を 1:1 で TC 化
+  #     → 整合性制約 7 項目のうち重要なもの (TC-002-1〜5) を選択
+
+  test_execution_strategy:
+    ci_on_pr:
+      cases: [TC-002, TC-NORM, TC-CLEANUP, TC-PROMPT, TC-SEV, TC-NORMRESP, TC-WEBHOOK]
+      type_filter: [unit, static]
+      frequency: PR 毎
+    ci_on_merge:
+      cases: [上記 + TC-FALLBACK, TC-E2E]
+      type_filter: [unit, static, integration]
+      frequency: merge 毎
+    manual_e2e:
+      note: |
+        実 AWS リソースでの cross-account 動作確認は cross-account-architecture
+        REQ-006 / REQ-007 が既に定義しているため本 TEST では省略。
+      frequency: デプロイ時 / 障害切り分け時

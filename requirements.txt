@@ -4,3 +4,4 @@ boto3-stubs[logs,bedrock-runtime]
 discord-webhook
 pytest
 pyyaml
+pydantic

@@ -1,4 +1,325 @@
 changelog:
+  - date: "2026-05-22"
+    type: version_up
+    target:
+      file: spec
+      id: "bedrock-prompt-generalization"
+      from: "0.4.0"
+      to: "0.5.0"
+    trigger: internal
+    reason: |
+      原文 (issue) との突合を実施し、抜け漏れ・乖離 (C-1〜C-16) を全列挙した
+      上で SPEC / PLAN / TEST を全面的に書き直した。命名と設計概念を最終形に
+      整理。PLAN には各 TASK の具体的 Python コード断片を含めた。
+
+      新規 REQ:
+      - REQ-017: pre_classification を動的コンテキストに埋め込む
+        (signal_kind.name を採用、フォールバック時は "fallback_generic")。
+        原文用語 pre_classification を「Bedrock への補助ヒント」として再定義。
+      - REQ-018: 1 アラーム = 1 signal_kind 前提の明示化。
+
+      改訂された REQ:
+      - REQ-001: STATIC_SYSTEM_PROMPT に必須要素 (failure_taxonomy b1〜b4,
+        severity 既定規則, 出力 JSON スキーマと字数制限) を明示。
+      - REQ-002: profile スキーマ刷新。signal_kind は配列で discriminated
+        union (type=verdict|ignored)、mechanism (log_marker|metric|
+        structured_result) を独立フィールド化。verdict 専用 5 フィールド
+        (success/failure/absence + max_severity_on_success +
+        severity_on_absence) と ignored 専用 (description) を type 別に必須化。
+      - REQ-005: signal_kind 解決を 2 段の辞書引きとして明文化
+        (profile.signal[] → profile.signal_kind[])。
+      - REQ-007: 出力 JSON 字数制限 (summary <=80, detail <=300,
+        actions[*].text <=80) を明記。
+      - REQ-008: 汎用フォールバック signal_kind の具体スキーマを明示
+        (Errors メトリクス + traceback、固定値で MEDIUM/MEDIUM)。
+      - REQ-009: severity 補正を signal_kind 由来のポリシーで行う (per-kind)
+        と明示。
+      - REQ-010: レポートヘッダーレンダリングテンプレート (Title / Target /
+        ResearchWindow / Alarm + Report(Summary)/(Detail) + Action 3 行) を
+        具体化。
+      - REQ-013: Env 全廃止対象を網羅 (ENVIRONMENT_NAME / LOG_GROUP_MAP 含む)。
+      - REQ-014: 新規追加デプロイ手順 (新クライアント / 既存クライアントの
+        2 ケース) を明文化。
+
+      命名統一 (v0.4.0 議論を継続):
+      - health_signals → signal_kind (配列)
+      - secondary_signals → signal_kind[type=ignored] に統合
+      - signal_selector 概念 → profile.signal[] (alarm → kind 名 マッピング配列)
+      - 旧 type (log_marker/metric/structured_result) → mechanism
+      - 新 type → verdict / ignored discriminator
+      - 旧 alarm_selectors / role などの中間命名は廃止
+
+      definitions に追加 / 明確化:
+      - メタ手続き (用語独立定義)
+      - pre_classification (Bedrock 補助ヒントとして再定義)
+      - configs/ ディレクトリ (AWS インフラ情報のみの責務)
+      - profile (運用 Lambda S3 配置、観測ロジックのみの責務)
+      - fallback_generic (REQ-008 のフォールバック実体)
+      - "-test" 統合不変条件 (全域)
+
+      スコープ外セクション追加 (原文 4 項目を SPEC.yml 内に組み込み):
+      - 実行完了系以外のアラームクラス
+      - Insights クエリの設計・最適化
+      - ケース判定 / 件数集計 / request_id 抽出 / deeplink 生成
+      - 複数アラーム同時発火のクロス相関・集約
+
+      Phase 2 連携点 (phase2_integration_note) を新設し、本 SPEC の出力 JSON が
+      後段パイプライン (コード深掘り解析・クライアント通知) の契約となる旨を
+      明示。
+
+      PLAN 全面書き換え (rev 4 → 5):
+      - TASK 単位で具体的 Python コード断片を埋め込み
+      - TASK-001: src/utils/profile.py の validate_profile() 全コード
+      - TASK-002: fetch_profile() (S3 GetObject + 例外統一) 全コード
+      - TASK-003: configs/hdw-sakura.yaml の具体内容 + Dockerfile 差分
+      - TASK-004: src/utils/config.py (Config dataclass + load_config +
+        normalize_alarm_name) 全コード
+      - TASK-005: src/utils/signal.py (resolve_signal_kind + FALLBACK_GENERIC
+        + extract_ignored_signals) 全コード
+      - TASK-006: src/utils/insights.py (build_insights_query) 全コード
+      - TASK-007: src/utils/prompt.py (STATIC_SYSTEM_PROMPT 全文 +
+        render_dynamic_context() 全コード)
+      - TASK-008: src/utils/response.py (normalize_bedrock_response +
+        apply_severity_policy + _clamp_severity) 全コード
+      - TASK-009: src/utils/webhooks.py (resolve_webhook_url + derive_env_label)
+        全コード
+      - TASK-010: src/utils/report.py (render_report_embed) 全コード
+      - TASK-011: HDW_Backend_Processor_0001 profile YAML の具体例 + 配置コマンド
+      - TASK-012: 旧コード削除リスト
+      - TASK-013: src/main.py (オーケストレーター) 全コード
+      - TASK-014: 新規アラーム追加デプロイ手順を deployment_workflow として
+        文書化
+
+      TEST 全面書き換え (rev 4 → 5):
+      - 各 TC に pytest コード断片 / 検証コマンドを含める
+      - type 分類追加 (unit / integration / e2e / static)
+      - 新 TC: TC-001-2 (システムプロンプト必須要素), TC-001-3 (動的コンテキスト
+        セクション順序), TC-002-1〜4 (profile スキーマ各種), TC-004-4
+        (Config 責務分離), TC-005-3 (-test 正規化), TC-007-2 (字数 truncate),
+        TC-008-1〜3 (フォールバック各種), TC-016-4 (-test キー検出),
+        TC-017-1〜3 (pre_classification 動作), TC-018-1 (signal[] 重複検出) 等。
+
+      確定された open_decisions (本セクションから削除):
+      - 旧 O-1〜O-3, 旧 O-7, A-7 は確定済 (v0.3.0〜0.4.0 の経緯参照)
+
+      残る open_decisions:
+      - O-4: failure_taxonomy override (current_lean: システム固定)
+      - O-5: 同時発火粒度 (current_lean: 独立通知)
+      - O-6: 命名スロット <CONTEXT_PREFIX> / <PROFILE_FILE> の実名化
+
+      設計意図:
+      原文の意図を最大限尊重しつつ、概念だけ記述された箇所 (severity 規約 /
+      フォールバック signal_kind / レポートテンプレ等) を具体仕様に昇格させた。
+      原文と異なる部分 (signal の構造化統合、severity 必須化、mechanism 名称
+      分離) は SPEC definitions / requirements で意図を明記。
+
+  - date: "2026-05-22"
+    type: version_up
+    target:
+      file: spec
+      id: "bedrock-prompt-generalization"
+      from: "0.3.0"
+      to: "0.4.0"
+    trigger: internal
+    reason: |
+      設計全域に効く不変条件「alarm 名末尾の "-test" は本番系の test と見なし、
+      引き当ての全ての対応表で正規化を経た同一キーとして扱う」を導入した。
+      これにより複数箇所のキー設計判断が連動して確定する。draft 段階の追補だが
+      新規 invariant と REQ 追加・既存 REQ の挙動明確化を伴うため minor version up。
+
+      確定された設計判断 (open_decisions から削除):
+      - 旧 O-2 (signal_selector の取得元)
+          → 運用 Lambda S3 上の profile.alarm_selectors 辞書から引く
+            (キーは正規化後 alarm 名)。
+      - 旧 O-7 (DISCORD_WEBHOOK_URLS 辞書キー)
+          → α (正規化後 alarm 名キー) で確定。
+            test/prod は同一 webhook エントリへ通知される。
+
+      追加された不変条件:
+      - alarm 名で引かれる全ての対応表 (configs/ ファイル名 /
+        DISCORD_WEBHOOK_URLS / profile.alarm_selectors) は正規化後 alarm 名を
+        キーとする。"-test" 末尾を含めるキーは禁止。
+
+      SPEC 変更:
+      - definitions: 「リソースプロファイル」を更新し alarm_selectors を含む
+        フィールドリストへ。新規定義 alarm_selectors / 「alarm 名の正規化」
+        を追加。DISCORD_WEBHOOK_URLS の説明を正規化後キー (α) に修正。
+      - REQ-002: profile スキーマに alarm_selectors を追加。AC-002-3
+        (selector 値が health_signals に存在することの検証) /
+        AC-002-4 (キーに "-test" 末尾を含めないことの検証) を新設。
+      - REQ-005: signal_selector の解決経路を
+        normalize_alarm_name → alarm_selectors → health_signals の 2 段引きと
+        明示。AC-005-2 を alarm_selectors ベースの不在判定に書き換え。
+        AC-005-3 (正規化後 alarm 名のみで引き当て) を新設。
+      - REQ-016: DISCORD_WEBHOOK_URLS の辞書キーを正規化後 alarm 名 (α) に
+        変更。AC-016-2 を test/prod が同一エントリから同じ URL に解決される
+        動作確認に書き換え。AC-016-4 (キーに "-test" 末尾を含めない検査)
+        を新設。
+      - open_decisions: O-2 / O-7 を削除し、確定済みコメントへ移行。
+
+      PLAN 変更 (rev 3 → 4):
+      - TASK-001: alarm_selectors の整合性検証 (AC-002-3 / AC-002-4) を
+        プロファイル検証関数に追加。
+      - TASK-004: 解決経路を「正規化 → alarm_selectors → health_signals」の
+        2 段引きに明文化。
+      - TASK-012: HDW プロファイル YAML に alarm_selectors フィールドを追加。
+      - TASK-015: 新規アラーム追加手順 6 (webhook 辞書追加) を正規化後キー
+        前提に書き換え (1 エントリで test/prod 両方カバー)。
+      - TASK-017: resolve_webhook_url() の引き当てを正規化後 alarm 名で
+        行う旨を明記。
+
+      TEST 変更 (rev 3 → 4):
+      - TC-002-3 / TC-002-4 を追加 (alarm_selectors の整合性検証)。
+      - TC-005-1〜3 を alarm_selectors ベースの動作検証に書き換え + TC-005-3
+        (正規化後 alarm 名で引かれること) を新設。
+      - TC-016-2 を α 設計 (同一エントリから同じ URL) に書き換え。
+      - TC-016-4 を新設 (キーに "-test" 末尾混入の検出)。
+
+      設計意図:
+      "-test" を含めて同一として扱う不変条件は、設計の複数箇所で似た判断
+      (test/prod を分けるか否か) を独立に答えるのではなく、プロジェクト全体で
+      単一のルールに従わせる狙い。これにより新規アラーム追加時の認知負荷を
+      下げ、test/prod の二重管理を排除する。
+      副作用として「test と prod を別チャンネルへ通知」「test と prod で
+      別 selector を使う」といった分離はサポートされなくなるが、現状そのような
+      要件は出ていない (出た場合は別の SPEC で扱う)。
+
+  - date: "2026-05-22"
+    type: version_up
+    target:
+      file: spec
+      id: "bedrock-prompt-generalization"
+      from: "0.2.0"
+      to: "0.3.0"
+    trigger: internal
+    reason: |
+      設定管理アーキテクチャを「Env dataclass + 個別 env var」から
+      「configs/*.yaml + load_config() + 単一 env var DISCORD_WEBHOOK_URLS」へ
+      根本的に変更した。draft 段階の追補だが構造変更を伴うため minor version up。
+
+      確定された設計判断 (open_decisions から削除):
+      - 旧 O-1 (引き当てキー)        → alarm_name 単位、load_config() 経由
+      - 旧 O-3 (レジストリ格納先)    → リポジトリ内 YAML、configs/<正規化名>.yaml
+      - 旧 A-7 (共通 env var の扱い) → 各 configs/*.yaml に統合
+
+      新規 open_decision:
+      - O-7: DISCORD_WEBHOOK_URLS 辞書のキー設計 (α 正規化後 / β 生 alarm 名)。
+        current_lean は (β) 生 alarm 名キー。test/prod を別チャンネルへ分離可能。
+
+      追加 / 変更:
+      - definitions に Config dataclass / load_config() / configs/ ディレクトリ
+        / DISCORD_WEBHOOK_URLS / -test 正規化規約を追加
+      - definitions の「レジストリ」を「概念。実体は configs/ と load_config() の
+        ペア」と再定義
+      - REQ-004 を「load_config + configs/*.yaml」ベースに全面書き換え
+        (AC-004-3 追加で正規化動作と欠落時挙動を明示)
+      - REQ-013 を全面改訂: Env dataclass 全面廃止、廃止 env var リスト確定、
+        ENVIRONMENT_NAME も廃止 (-test 末尾から導出)
+      - REQ-014 を「新規アラーム追加時の手順 (新クライアント / 既存クライアント
+        の 2 ケース)」に書き換え、手順 1 (config 作成) と手順 6 (webhook 追加)
+        の失敗モードを AC-014-4 で明示
+      - 新 REQ-015: load_config() / Config dataclass の責務と実装要件
+      - 新 REQ-016: DISCORD_WEBHOOK_URLS の JSON 辞書スキーマと解決経路
+      - PLAN TASK-003 を configs/ 移行に書き換え (config/alarm_log_groups.yml
+        を完全置換)
+      - PLAN TASK-014 を Env dataclass 全廃止 + env var 一括整理に拡張
+      - PLAN TASK-013 (オーケストレーター) を Config 経由のフローに改訂
+      - PLAN 新 TASK-016 (load_config 実装) / TASK-017 (DISCORD_WEBHOOK_URLS
+        パース + resolve_webhook_url 実装)
+      - PLAN TASK-015 (デプロイ手順) を「新クライアント / 既存クライアント」の
+        2 ケース分岐に書き換え
+      - TEST TC-004 系を load_config / -test 正規化 / 欠落時挙動の検査に書き換え
+      - TEST TC-013 系を Env 全削除検査に書き換え + TC-013-4 (ENVIRONMENT_NAME
+        削除) 追加
+      - TEST 新 TC-015-1〜3 (load_config 動作) / TC-016-1〜3 (webhook 解決)
+      - TEST TC-014 系を 2 ケース分岐検査に書き換え + TC-014-4 追加
+
+      設計意図:
+      レジストリインデックスファイル方式は柔軟だが、現状の運用規模 (クライアント
+      1〜数件) では「alarm 名 = YAML ファイル名」という命名規約だけで引き当てが
+      決定論的に成立する。中央集権インデックスを持たないことで、新規アラーム
+      追加が「YAML 1 ファイル新設 + webhook 辞書に 1 行追加」で完結する単純な
+      モデルに収束する。
+      Env dataclass の全面廃止は「設定の所在を 1 種類に集約する (= configs/*.yaml)」
+      設計を完成させるための必須条件。webhook URL だけは性質が異なる (シークレット
+      + アラーム名で動的解決) ため例外として env var に残す。
+
+  - date: "2026-05-22"
+    type: version_up
+    target:
+      file: spec
+      id: "bedrock-prompt-generalization"
+      from: "0.1.0"
+      to: "0.2.0"
+    trigger: internal
+    reason: |
+      デプロイ動線に関する設計影響を本 SPEC に取り込んだ。draft 段階の追補で
+      breaking 議論ではないが、新規 REQ 追加 (REQ-013 / REQ-014) を伴うため
+      minor version up とする。
+
+      追加 / 変更:
+      - REQ-013: クライアント固有 env var (CROSS_ACCOUNT_ROLE_ARN /
+        TARGET_FUNCTION_NAME) をレジストリへ吸収する。Lambda environment と
+        GitHub Actions のデプロイジョブから当該 env var の配信を削除する。
+        EXTERNAL_ID は cross-account-architecture v3.4.0 で既に廃止済。
+      - REQ-014: 新規監視対象追加時のデプロイ手順を PLAN に文書化することを
+        要件化した。手順は O-3 (レジストリ格納先) の選択に応じて分岐する。
+      - O-3 (open_decision) の reason に hidden_consequence を追記し、
+        本選択が「クライアント追加時に Lambda 再デプロイが必要か否か」を
+        決める旨を明示した。
+      - PLAN に TASK-014 (env var 削除作業) と TASK-015 (新規追加手順の
+        文書化) を追加。PLAN rev: 1 → 2。
+      - TEST に TC-013-1〜3 / TC-014-1〜3 を追加。TEST rev: 1 → 2。
+
+      設計意図:
+      本 SPEC の本質は「コード変更を伴わずにクライアント / 監視対象を増やせる
+      ようにする」ことにある。env var 経路を温存したままレジストリを乗せると、
+      クライアント追加のたびに env var を増やす形になり、設計目的を半分しか
+      果たせない。したがって env var 吸収を REQ として明示し、削除を AC で
+      担保する。
+
+  - date: "2026-05-22"
+    type: new_spec
+    target:
+      file: spec
+      id: "bedrock-prompt-generalization"
+      version: "0.1.0"
+    trigger: internal
+    reason: |
+      Bedrock アラーム原因解析プロンプトの汎用化 (health_signal 抽象化) を
+      新規 SPEC として起こした。現状 src/utils/prompt.py は監視対象
+      HDW_Backend_Processor_0001 固有の運用前提・成功/失敗判定基準・許容分岐を
+      システムプロンプトにベタ書きしており、別の運用 Lambda を監視対象に
+      加える際に prompt.py の改修を要する。本 SPEC は Bedrock 入力を
+      静的システムプロンプト (メタ手続きのみ) と動的コンテキスト
+      (アラームごとの素材合成) に二層化し、運用 Lambda 固有情報を
+      「リソースプロファイル」という構造化データへ外出しすることで、
+      レポート Lambda 側のコードを監視対象非依存にする。
+
+      初版 (v0.1.0) は draft。open_decisions (O-1〜O-6) を未確定のまま骨格を
+      切ったもので、命名スロットは <CONTEXT_PREFIX> 等の変数表記で記述している。
+      実装着手前に各 open_decision を確定し、命名スロットを一括実名化する
+      パッチで version up する。
+
+      関連 dependency:
+      - cross-account-architecture: AssumeRole 経路を踏襲。S3 GetObject 権限を
+        追加する形で拡張する (PLAN TASK-002)。
+
+      設計骨子:
+      - 静的システムプロンプトはメタ手続き (healthy / failed / absent の
+        3 分岐推論) と出力 JSON スキーマのみを記述。監視対象固有の語彙ゼロ。
+      - リソースプロファイルは運用 Lambda の既存 S3 バケットの専用 prefix に
+        配置 (Phase A は手動配置、運用 Lambda 側のコード・CI/CD は改修しない)。
+      - レジストリでアラーム → 運用 Lambda アクセス情報を引き当て。既存
+        config/alarm_log_groups.yml の拡張として実装する想定。
+      - signal_selector はコード側で決定論的に解決し、LLM には解決済み
+        health_signal を 1 個だけ渡す。
+      - 出力 JSON は verdict / severity / confidence / summary / detail /
+        actions[{phase, text}] の新スキーマに統一。旧 root_cause_hypothesis /
+        suggested_actions は廃止 (後方互換シムを残さない)。
+      - フォールバックを 2 系統 (a プロファイル未登録 / b signal_selector
+        解決失敗) で実装。
+
   - date: "2026-05-21"
     type: version_up
     target:

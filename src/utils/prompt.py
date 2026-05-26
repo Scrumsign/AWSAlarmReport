@@ -185,6 +185,62 @@ def render_prompt_case_lambda_failure() -> tuple[str, str]:
     )
 
 
+def render_prompt_case_unknown() -> tuple[str, str]:
+    """
+    エラー種別不明（ログあり・status=error なし）用のケース名と追加指示文を返す。
+
+    呼び出しトリガー: log_rows は存在するが status="error" のログが 1 件もない。
+    """
+    return (
+        "エラー種別不明（ログあり・エラーなし）",
+        "直近時間窓内に Lambda の実行ログは存在するが、status=\"error\" のログが確認できない。\n"
+        "→ Lambda は起動しているが、成功・失敗いずれとも断定できない状態。\n"
+        "  考えられる原因:\n"
+        "    - 処理が完了したが success ログの出力がない（ロギング実装の漏れ）\n"
+        "    - 処理が途中で中断されたが例外が補足されなかった\n"
+        "    - Alarm の発火条件が実際のエラーと対応していない\n"
+        "→ ログを精査して正常・異常のいずれに近いかを判断し、confidence は低めに設定する。\n"
+        "suggested_actions は手動調査の手順を優先して提案してください。"
+    )
+
+
+def render_prompt_case_unknown_alarm() -> tuple[str, str]:
+    """
+    想定外アラーム（命名規約外）用のケース名と追加指示文を返す。
+
+    呼び出しトリガー: AlarmName が hdw-<ship_name>[-test] 形式に一致しない。
+    """
+    return (
+        "想定外アラーム（命名規約外）",
+        "受信した AlarmName がシステムの命名規約（hdw-<ship_name>[-test]）に一致しない。\n"
+        "→ このシステムが処理対象としていないアラームが誤って届いた可能性がある。\n"
+        "  考えられる原因:\n"
+        "    - アラーム設定の誤り（命名規約に合っていない）\n"
+        "    - 別システムのアラームが同一 SNS トピックに紐付けられている\n"
+        "→ ログとの対応が取れないため、提供できる分析は限定的。\n"
+        "  severity は LOW、confidence は low として、アラーム設定の確認を促してください。"
+    )
+
+
+def build_system_prompt(error_id: str, error_description: str) -> str:
+    """
+    error_id に対応するケース関数を選択してシステムプロンプトを構築し、
+    error-profiles.yml の description を末尾に注入して返す。
+    """
+    _CASE_MAP = {
+        "s3_data_missing": render_prompt_case_no_logs,
+        "lambda_failure":  render_prompt_case_lambda_failure,
+        "unknown":         render_prompt_case_unknown,
+        "unknown_alarm":   render_prompt_case_unknown_alarm,
+    }
+    case_fn = _CASE_MAP.get(error_id, render_prompt_case_lambda_failure)
+    case_name, case_instructions = case_fn()
+    system_prompt = render_prompt_system_base(case_name, case_instructions)
+    if error_description:
+        system_prompt += f"\n\n# エラープロファイル\n{error_description.strip()}"
+    return system_prompt
+
+
 def render_prompt_user(
     alarm_name: str,
     timestamp: str,

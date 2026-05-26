@@ -1,0 +1,1119 @@
+# =============================================================================
+# 全体概要
+# =============================================================================
+# 本仕様は「Bedrock アラーム原因解析プロンプトの汎用化（health_signal 抽象化）」
+# を定義する。原 issue「Bedrock アラーム原因解析プロンプトの汎用化」の意図を
+# 踏襲しつつ、用語と構造を本仕様独自に整理した。
+#
+# 中心テーゼ:
+#   Bedrock への入力を以下の 2 層に分離し、システムプロンプトを監視対象非依存の
+#   「メタ手続き」へ昇格させ、運用 Lambda 固有情報を「リソースプロファイル」
+#   というデータに外出しする。
+#
+#     静的: システムプロンプト (メタ手続きのみ。監視対象固有語彙ゼロ)
+#       - 「権威シグナルを起点に healthy / failed / absent の 3 分岐で推論する」
+#         というアルゴリズム
+#       - 既定 failure_taxonomy (b1〜b4)
+#       - 出力 JSON スキーマの規定
+#
+#     動的: 動的コンテキスト (アラームごとに合成する user prompt)
+#       - アラーム情報 (alarm_name / alarm_description / fire_time /
+#         pre_classification)
+#       - 解決済み権威シグナル (signal_kind 1 個)
+#       - ignored 系シグナル群 (障害根拠としない参考情報)
+#       - input_identifiers (実行を識別する構造化フィールド名)
+#       - 調査時間窓
+#       - 抽出ログ
+#
+# 構成上の主要な決定:
+#
+#   (a) 設定の 2 分岐:
+#       - configs/<正規化 alarm 名>.yaml (リポジトリ内): AWS インフラ情報のみ
+#         (account_id / aws_region / assume_role_arn / log_group /
+#          profile_location / bedrock_model_id / bedrock_max_tokens /
+#          cloudwatch_logs_query_poll_interval_sec)
+#       - profile.yaml (運用 Lambda 側 S3): 観測ロジックのみ
+#         (function_name / signal_kind / signal / input_identifiers)
+#       - DISCORD_WEBHOOK_URLS (Lambda env var, JSON): webhook 配信先のみ
+#
+#   (b) "-test" 末尾の正規化:
+#       - alarm 名で引かれる全ての対応表は正規化後 alarm 名をキーとする
+#       - 適用対象: configs/<...>.yaml ファイル名、DISCORD_WEBHOOK_URLS キー、
+#         profile.signal[].name キー
+#       - test と prod を運用設定上は同一として扱う
+#
+#   (c) signal の構造 (原文の health_signals + secondary_signals を統合):
+#       - profile.signal_kind は配列、各エントリに type (verdict|ignored) と
+#         mechanism (log_marker|metric|structured_result) を持つ
+#       - profile.signal は alarm → kind 名のマッピング配列
+#       - 障害判定 (verdict) に使うのは type=verdict のみ
+#       - type=ignored は Bedrock に「これは障害根拠ではない」と伝える参考情報
+#
+#   (d) severity の所在:
+#       - メタ手続き既定: healthy 最大 MEDIUM / failed HIGH / absent MEDIUM
+#       - profile.signal_kind[type=verdict] が max_severity_on_success と
+#         severity_on_absence を必須として持つ (既定値依存ではなく明示)
+#       - コード側で Bedrock 応答を補正
+#
+#   (e) フォールバック 2 系統:
+#       - (a) profile 未登録 / 取得失敗 / スキーマ違反
+#       - (b) signal_kind 解決失敗 (signal[] に該当エントリなし / 値整合違反)
+#       - いずれも fallback_generic 定数 (Errors メトリクス + traceback) で続行
+#
+# Phase A (本仕様の初期実装) では profile YAML を運用 Lambda の既存 S3 に
+# 手動配置する。運用 Lambda のコード・CI/CD は改修しない。
+#
+# =============================================================================
+# 構成図 (アラーム発火 → Discord 通知)
+# =============================================================================
+#
+#   SNS event ──┐
+#               ▼
+#   (1) Reporter Lambda                              [自社アカウント]
+#               │ AlarmName / AWSAccountId / AlarmArn を抽出
+#               ▼
+#   (2) load_config(alarm_name)
+#       configs/<正規化名>.yaml を読込 → Config dataclass
+#               │
+#       (3) STS AssumeRole (config.assume_role_arn を使用)
+#               │
+#       ┌───────┴───────────────────────────┐
+#       ▼                                   ▼
+#   (4) S3 GetObject                    (5) CloudWatch Logs Insights
+#       (config.profile_location から     (config.log_group +
+#        profile YAML を取得)              profile.input_identifiers で
+#                                          クエリ動的生成)
+#       │                                   │
+#       ▼                                   ▼
+#   profile dict                         log rows
+#       │
+#   (6) resolve_signal_kind(alarm_name, profile)
+#       profile.signal[] で alarm → kind 名を引き、
+#       profile.signal_kind[] でその名前のエントリを取得
+#       (見つからなければ fallback_generic を採用)
+#       │
+#   (7) 動的コンテキスト組み立て (user prompt)
+#       素材: アラーム情報 (含 pre_classification = signal_kind.name) +
+#             解決済み権威シグナル + ignored シグナル列 +
+#             input_identifiers + 調査時間窓 + 整形済みログ
+#       │
+#       │  ┌── 静的システムプロンプト (不変)
+#       ▼  ▼
+#   (8) Bedrock Converse 呼び出し
+#       │
+#       ▼
+#       応答 JSON { verdict / severity / confidence /
+#                   summary / detail / actions }
+#       │
+#   (9) normalize_response + severity 補正
+#       - 字数制限 clamp
+#       - verdict=healthy → max_severity_on_success で clamp
+#       - verdict=absent  → severity_on_absence で上書き
+#       │
+#       ▼
+#   (10) レポートヘッダーをコード側でレンダリング
+#        Title / Target / ResearchWindow / Alarm
+#       │
+#   (11) resolve_webhook_url(alarm_name)
+#        DISCORD_WEBHOOK_URLS から URL を引く
+#       │
+#       ▼
+#   (12) Discord 通知 (Embed で投稿)
+#
+# =============================================================================
+
+spec:
+  id: "bedrock-prompt-generalization"
+  version: "0.5.0"
+  title: "Bedrock アラーム原因解析プロンプトの汎用化 (health_signal 抽象化)"
+  created_at: "2026-05-22"
+  authors:
+    - name: "scrumsign-takuyakimura"
+  status: "draft"
+
+  # NOTE: spec.id およびディレクトリ名は仮称。設計確定時に正式名へリネームする
+  # こと。残る命名スロット (<CONTEXT_PREFIX> / <PROFILE_FILE>) は O-6 で実名化。
+
+  constitution:
+    id: "main"
+    version: "1.0.0"
+
+  dependencies:
+    - id: "cross-account-architecture"
+      relation: "踏襲"
+      reason: |
+        AssumeRole 経路 (cross-account-architecture REQ-003) を本 SPEC でも
+        前提とする。本 SPEC は当該経路に「S3 GetObject (運用 Lambda 側
+        <CONTEXT_PREFIX> 配下)」権限を追加することで profile 取得を成立させる。
+
+  definitions:
+
+    # ─── アーキテクチャの主要概念 ───
+
+    - term: "オーケストレーター"
+      description: |
+        アラーム受信からプロファイル解決・コンテキスト組み立て・Bedrock 呼び出し
+        ・レポート生成・通知までを担う処理本体。AI ではなく通常のコード
+        (Reporter Lambda 上の Python 実装)。
+
+    - term: "メタ手続き"
+      description: |
+        「権威シグナルを読んで verdict 3 分岐 (healthy / failed / absent) する」
+        という、監視対象に依存しない解析アルゴリズム。システムプロンプトに
+        書き、Bedrock が遂行する。失敗時の原因分類 (b1〜b4 = failure_taxonomy)
+        も本手続きの一部。
+
+    - term: "システムプロンプト (静的)"
+      description: |
+        Bedrock の system フィールドに渡す指示文。全アラームで同一内容を
+        使い回す不変文字列。以下のみを含む:
+          - メタ手続き (verdict 3 分岐の規約)
+          - severity 既定値 (verdict=healthy 最大 MEDIUM / failed HIGH /
+            absent MEDIUM, confidence=low)
+          - 既定 failure_taxonomy (b1〜b4)
+          - 出力 JSON スキーマと制約 (字数制限を含む)
+        監視対象固有の関数名・ログイベント名・エラーメッセージ・許容分岐は
+        一切含めない。
+
+    - term: "動的コンテキスト"
+      description: |
+        Bedrock の messages[0].content[0].text に渡す user prompt。
+        アラーム 1 件ごとに以下のセクションを順に合成する:
+          1. アラーム情報 (alarm_name / alarm_description / fire_time /
+                           pre_classification)
+          2. 解決済み権威シグナル (signal_kind 1 個)
+          3. ignored 系シグナル列 (障害根拠として使わない参考情報)
+          4. input_identifiers (実行を識別するフィールド名)
+          5. 調査時間窓 (JST)
+          6. 抽出ログ (時間窓内・時刻昇順)
+
+    - term: "リソースプロファイル (profile)"
+      description: |
+        監視対象 Lambda 1 個分の観測契約を表す構造化データ (YAML)。運用
+        Lambda 側 S3 バケットの <CONTEXT_PREFIX>/<PROFILE_FILE> に配置される。
+        トップレベルフィールド:
+          function_name        (str)   監視対象 Lambda 名
+          signal_kind          (list)  signal 種別の定義カタログ
+          signal               (list)  alarm → signal_kind 名のマッピング
+          input_identifiers    (list)  1 実行を識別する構造化ログフィールド名
+        詳細スキーマは REQ-002 を参照。
+
+    - term: "signal_kind"
+      description: |
+        profile 内のフィールド。signal 種別の定義カタログ (配列)。
+        各エントリは「verdict (障害判定に使う)」と「ignored (障害根拠としない
+        参考情報)」を type 値で discriminated に区別する。
+        フィールド (共通): name / type / mechanism / locator
+        type=verdict 追加: success_condition / failure_condition /
+                           absence_hypothesis / max_severity_on_success /
+                           severity_on_absence
+        type=ignored 追加: description
+        詳細は REQ-002 参照。
+
+    - term: "signal (profile 内のフィールド)"
+      description: |
+        profile 内のフィールド。alarm 名 (正規化後) → signal_kind 名 のマッピング
+        配列。各エントリは { name: 正規化 alarm 名, kind: signal_kind.name }。
+        コード側が決定論的に「このアラームはどの kind を見るべきか」を解決
+        するための表。
+
+    - term: "verdict"
+      description: |
+        Bedrock 解析の結論。値は healthy / failed / absent の 3 値。
+          - healthy: success_condition を満たすレコードが時間窓内に存在
+          - failed:  failure_condition を満たすレコード、または traceback あり
+          - absent:  権威シグナルが時間窓内に 1 件も存在しない
+        判定は Bedrock が行う。コード側は判定ロジックを持たない。
+
+    - term: "severity"
+      description: |
+        verdict と対をなす緊急度シグナル (HIGH / MEDIUM / LOW)。Discord embed
+        の色や運用者の対応優先度に直結する。メタ手続き既定値:
+          verdict=failed  → HIGH (固定)
+          verdict=healthy → MEDIUM 最大 (HIGH 禁止)
+          verdict=absent  → MEDIUM (confidence=low)
+        profile.signal_kind[type=verdict] が max_severity_on_success と
+        severity_on_absence を持ち、コード側が Bedrock 応答を補正する
+        (詳細は REQ-009)。
+
+    - term: "failure_taxonomy"
+      description: |
+        verdict=failed 時の原因分類。既定値:
+          b1: コードバグ (KeyError / ValueError / AttributeError / TypeError 等)
+          b2: 入力データ異常 (構造不整合 / 必須フィールド欠落 / 想定外の値域)
+          b3: 設定欠落 (os.environ KeyError / 設定ファイル不在 / 等)
+          b4: 外部依存障害 (AWS API 失敗 / ネットワーク / AccessDenied / 等)
+        システムプロンプトに既定値として含める (REQ-001 / REQ-004)。
+        profile による上書き可否は O-4 (未決) で確定。
+
+    - term: "pre_classification"
+      description: |
+        動的コンテキストの「アラーム情報」セクションに含まれる補助フィールド。
+        値はコード側で決定論的に設定された signal_kind.name そのもの。
+        例: "completion_success" / "latency" / "fallback_generic"。
+        Bedrock に対する「このアラームは何系の signal_kind を見るのか」の
+        補助ヒント (解決済み signal_kind 本体と情報重複するが許容)。
+        原文では signal_selector 解決の入力候補として位置付けられていたが、
+        本仕様では出力側 (Bedrock へのヒント) に再定義した。
+
+    - term: "configs/ ディレクトリ"
+      description: |
+        Reporter Lambda リポジトリ内のディレクトリ。1 アラーム = 1 YAML ファイル
+        (configs/<正規化 alarm 名>.yaml)。AWS インフラ情報のみを保持する
+        (account_id / aws_region / assume_role_arn / log_group /
+         profile_location / bedrock_model_id / bedrock_max_tokens /
+         cloudwatch_logs_query_poll_interval_sec)。観測ロジックは含まない。
+        Lambda Docker image に同梱され、コールドスタート時に load_config() で
+        読み込まれる。
+
+    - term: "Config (dataclass)"
+      description: |
+        load_config() の戻り値型 (frozen, slots)。configs/<正規化名>.yaml の
+        全フィールドを型付き保持する。
+        フィールド集合と型は REQ-013 を参照。
+
+    - term: "load_config()"
+      description: |
+        Reporter Lambda 内の関数。alarm_name を引数に取り、対応する Config を
+        返す。
+        手順:
+          1. normalize_alarm_name(alarm_name) で正規化 (末尾 "-test" 除去)
+          2. configs/<正規化名>.yaml を読込
+          3. yaml.safe_load() → スキーマ検証 → Config dataclass を返す
+        ファイル不在・YAML 構文エラー・スキーマ違反は明示例外を投げ、
+        REQ-008 (a) フォールバックに分岐する。
+
+    - term: "normalize_alarm_name()"
+      description: |
+        alarm 名末尾が "-test" のとき末尾 5 文字を除去し、それ以外はそのまま
+        返す純関数。本仕様の "-test 統合" 不変条件の単一実装点。
+
+    - term: "alarm 名の正規化 ("-test" 統合の不変条件)"
+      description: |
+        本仕様の全域で適用される不変条件: alarm 名末尾の "-test" は本番系の
+        test と見なし、引き当ての全ての対応表で正規化を経た同一キーとして扱う。
+        適用対象:
+          - configs/<正規化名>.yaml のファイル名
+          - DISCORD_WEBHOOK_URLS の辞書キー
+          - profile.signal[].name のキー
+          - その他 alarm 名で引かれる全対応表
+        意図: test/prod の運用設定を二重管理しない。CloudWatch 上の alarm 名
+        自体は別物 ("hdw-sakura-test") として残るが、Reporter Lambda 側では
+        同一として扱う。embed 表記で test/prod を区別する場合は alarm 名末尾
+        "-test" 有無から導出する。
+
+    - term: "DISCORD_WEBHOOK_URLS"
+      description: |
+        Lambda の唯一の env var として残るシークレット保管領域。値は JSON 文字列
+        で、正規化後 alarm 名 → Discord webhook URL の辞書。
+        例: { "hdw-sakura": "https://discord.com/api/webhooks/...", ... }
+        cold start で json.loads → プロセス内 dict にキャッシュ。
+        詳細は REQ-016 参照。
+
+    - term: "fallback_generic"
+      description: |
+        REQ-008 のフォールバック時に注入する汎用 signal_kind。コード定数として
+        Reporter Lambda 内に定義する。原文「Errors メトリクス + traceback」を
+        満たす内容で、profile が無くても Bedrock 解析が成立する最低限の情報を
+        提供する。具体スキーマは REQ-008 description 参照。
+
+    - term: "Phase A (手動配置)"
+      description: |
+        本仕様の初期実装フェーズ。profile YAML を運用 Lambda の既存 S3 バケットの
+        <CONTEXT_PREFIX> に手動で put する。運用 Lambda のコード・CI/CD は改修
+        しない。Phase B 以降の所有権移譲は本 SPEC のスコープ外。Reporter Lambda
+        側の契約 (prefix / ファイル構造 / フィールド名) を不変に保つ設計で吸収
+        する。
+
+  open_decisions:
+    # 確定済み (本セクションから削除済み):
+    #   - 旧 O-1 (レジストリ引き当てキー)         → alarm_name 単位
+    #   - 旧 O-2 (signal_selector 取得元)         → profile.signal[]
+    #   - 旧 O-3 (レジストリ格納先)               → リポジトリ内 YAML
+    #   - 旧 O-7 (DISCORD_WEBHOOK_URLS キー)      → 正規化後 alarm 名
+    #   - 旧 A-7 (Lambda 共通 env var)            → configs/*.yaml に統合
+    - id: "O-4"
+      title: "failure_taxonomy をプロファイルで上書き可能にするか"
+      options:
+        - "システム固定 (b1〜b4 で運用開始)"
+        - "プロファイルで部分上書き可"
+      current_lean: "システム固定"
+      reason: |
+        b1〜b4 が監視対象 Lambda の性質に依存しない普遍的分類として機能
+        するため。固有事情は signal_kind.description に書く余地がある。
+    - id: "O-5"
+      title: "同一 Lambda で複数アラームが同時発火した場合の通知粒度"
+      options:
+        - "1 アラーム = 1 Bedrock 呼び出し = 1 レポート、各々独立通知"
+        - "クロス相関して 1 通に集約"
+      current_lean: "独立通知"
+      reason: |
+        v1 スコープ外 (スコープ外セクション参照)。独立通知が原文の方針。
+    - id: "O-6"
+      title: "命名スロットの実名"
+      slots:
+        - "<CONTEXT_PREFIX>": "運用 Lambda S3 バケット内の profile 配置先 prefix"
+        - "<PROFILE_FILE>": "profile YAML のファイル名"
+      note: |
+        本 SPEC では変数表記のまま記述する。実装着手前に一括確定し、
+        SPEC を実名に置換するパッチで反映する。
+
+  # =============================================================================
+  # profile スキーマ完全形 (REQ-002 の規範)
+  # =============================================================================
+  # 本セクションは profile YAML の構造を正規仕様としてまとめる。
+  # 具体的な値の例は PLAN.yml の TASK-011 / 「profile YAML 具体例集」を参照。
+  #
+  # トップレベル構造:
+  #   function_name: <str>            # 必須
+  #   signal_kind:                    # 必須、空でない配列
+  #     - <signal_kind entry>
+  #   signal:                         # 必須、空でも可
+  #     - <signal entry>
+  #   input_identifiers:              # 必須、空でない配列 (要素は非空 str)
+  #     - <str>
+  #
+  # ─── signal_kind エントリの discriminated union ───
+  #
+  # 共通必須フィールド (全 type 共通):
+  #   name        (str)    signal_kind 識別子。配列内で一意
+  #   type        (enum)   verdict / ignored
+  #   mechanism   (enum)   log_marker / metric / structured_result
+  #   locator     (str)    どこを見るか (自然言語)
+  #
+  # type=verdict 専用フィールド (全て必須):
+  #   success_condition       (str)    成功条件
+  #   failure_condition       (str)    失敗条件
+  #   absence_hypothesis      (str)    不在仮説
+  #   max_severity_on_success (enum)   LOW / MEDIUM / HIGH
+  #   severity_on_absence     (enum)   LOW / MEDIUM / HIGH
+  #
+  # type=ignored 専用フィールド (必須):
+  #   description             (str)    無視理由の説明
+  #
+  # type=ignored には success_condition / failure_condition /
+  # absence_hypothesis / severity 系フィールドが存在してはならない。
+  #
+  # ─── signal エントリ ───
+  #
+  #   name  (str)  正規化後 alarm 名。"-test" 末尾を含まない。配列内で一意
+  #   kind  (str)  signal_kind[].name のいずれかに存在し、かつ type=verdict
+  #
+  # ─── 整合性制約 ───
+  #
+  #   (1) signal_kind[].name は配列内で重複なし
+  #   (2) signal[].name は配列内で重複なし
+  #   (3) signal[].name は "-test" 末尾を含まない
+  #   (4) signal[].kind は signal_kind[].name のいずれかに存在
+  #   (5) signal[].kind が指す signal_kind は type=verdict であること
+  #   (6) type=verdict は max_severity_on_success / severity_on_absence 必須
+  #   (7) type=ignored は description 必須
+  #
+  #   違反時: ProfileSchemaError → REQ-008 (a) フォールバック
+  #
+  # ─── 「コード側で使う」と「Bedrock に渡すだけ」の区分 ───
+  #
+  # コード側で if / 辞書引き / ループに使う:
+  #   function_name / signal_kind[].name / signal_kind[].type /
+  #   signal_kind[].mechanism / signal[].name / signal[].kind /
+  #   input_identifiers / max_severity_on_success / severity_on_absence
+  #
+  # Bedrock に文字列として渡すだけ:
+  #   signal_kind[].locator / success_condition / failure_condition /
+  #   absence_hypothesis / description
+  #
+  # =============================================================================
+
+  requirements:
+
+    # ─── 静的システムプロンプト / 動的コンテキスト ───
+
+    - id: "REQ-001"
+      title: "システムプロンプトと動的コンテキストを分離する"
+      description: |
+        Bedrock への入力を 2 層に分け、システムプロンプト側には監視対象固有の
+        語彙を一切含めない。
+        - 静的システムプロンプトに含めるもの:
+            (a) メタ手続き (権威シグナル → verdict 3 分岐の規約)
+            (b) severity 既定規則 (failed=HIGH 固定 / healthy 最大 MEDIUM /
+                absent MEDIUM, confidence=low)
+            (c) 既定 failure_taxonomy (b1 コードバグ / b2 入力データ異常 /
+                b3 設定欠落 / b4 外部依存障害) の定義
+            (d) 出力 JSON スキーマと字数制限 (REQ-007)
+            (e) secondary_signals に列挙された情報を障害根拠としない指示
+        - 静的システムプロンプトに含めてはならないもの:
+            - 特定 Lambda 名 (例: HDW_Backend_Processor_0001)
+            - 特定ログイベント名 (例: lambda_complete)
+            - 特定エラーメッセージ (例: NG file / pia_data is None)
+            - ship_name 等の運用識別子
+        - 動的コンテキストには 6 セクションを順に含める:
+            アラーム情報 / 解決済み権威シグナル / ignored 系シグナル列 /
+            input_identifiers / 調査時間窓 / 抽出ログ
+      acceptance_criteria:
+        - id: "AC-001-1"
+          description: |
+            STATIC_SYSTEM_PROMPT 定数に以下の語が一切含まれないこと
+            (テキスト検査 + 人間レビュー):
+              "HDW_Backend_Processor_0001", "ship_name", "ship_timestamp",
+              "input_key", "lambda_complete", "NG file", "pia_data",
+              "csv parse failed", "S3 ZIP"
+        - id: "AC-001-2"
+          description: |
+            STATIC_SYSTEM_PROMPT に以下が含まれること:
+              - failure_taxonomy の b1〜b4 を文字列として明記
+              - severity の verdict 別既定規則を文字列として明記
+              - 出力 JSON スキーマの enum 値と字数制限を文字列として明記
+        - id: "AC-001-3"
+          description: |
+            render_dynamic_context() の戻り値文字列に以下の 6 セクション
+            ヘッダが順番に現れること (正規表現で検証):
+              "# アラーム情報" → "# 権威シグナル" → "# 障害根拠としない情報"
+              → "# 実行識別フィールド" → "# 調査時間窓" → "# 抽出ログ"
+
+    # ─── リソースプロファイル ───
+
+    - id: "REQ-002"
+      title: "リソースプロファイル (profile) のスキーマを定義する"
+      description: |
+        運用 Lambda 1 個分の観測契約を YAML で表現する。
+
+        トップレベルフィールド (全て必須):
+          function_name:      str  (監視対象 Lambda 名)
+          signal_kind:        list (signal 種別カタログ)
+          signal:             list (alarm → signal_kind 名 マッピング)
+          input_identifiers:  list[str] (1 実行を識別する構造化ログフィールド名)
+
+        signal_kind 配列の各エントリ (共通必須):
+          name:        str  (signal_kind の識別子)
+          type:        enum (verdict | ignored)
+          mechanism:   enum (log_marker | metric | structured_result)
+          locator:     str  (どこを見るか。自然言語の指示)
+
+        type=verdict 追加フィールド (全て必須):
+          success_condition:       str
+          failure_condition:       str
+          absence_hypothesis:      str
+          max_severity_on_success: enum (LOW | MEDIUM | HIGH)
+          severity_on_absence:     enum (LOW | MEDIUM | HIGH)
+
+        type=ignored 追加フィールド (必須):
+          description: str (障害根拠として使わない理由の説明)
+
+        signal 配列の各エントリ (全て必須):
+          name: str (正規化後 alarm 名)
+          kind: str (profile.signal_kind[].name に存在する識別子)
+
+        整合性制約:
+          - signal[].kind は signal_kind[].name に存在する値であること
+          - signal[].kind が指す signal_kind は type=verdict であること
+            (ignored が verdict 解決対象になることはない)
+          - signal[].name は "-test" 末尾を含まないこと
+          - signal[] 内で name 重複なし、signal_kind[] 内で name 重複なし
+      acceptance_criteria:
+        - id: "AC-002-1"
+          description: |
+            profile YAML を yaml.safe_load + 検証関数にかけ、必須フィールド
+            欠落で ProfileSchemaError 相当の例外が投げられること。
+            REQ-008 (a) フォールバックに倒れること。
+        - id: "AC-002-2"
+          description: |
+            type / mechanism の enum 違反 (列挙値外の文字列) でスキーマ違反と
+            扱われること。
+        - id: "AC-002-3"
+          description: |
+            signal[].kind が signal_kind[].name に存在しない場合、または
+            指す signal_kind が type=ignored の場合、スキーマ違反として扱う。
+        - id: "AC-002-4"
+          description: |
+            signal[].name に "-test" 末尾を含む文字列があればスキーマ違反。
+
+    - id: "REQ-003"
+      title: "profile を運用 Lambda の既存 S3 に配置する"
+      description: |
+        profile YAML は運用 Lambda の既存入出力 S3 バケットの専用 prefix
+        (<CONTEXT_PREFIX>) 配下に配置する。Phase A では Reporter Lambda 担当が
+        手動で put する (運用 Lambda チームの作業を要求しない)。
+        運用 Lambda の関数コード zip / image / 実行 IAM Role / CI/CD パイプ
+        ラインに本仕様起因の変更を加えない。
+        運用 Lambda チームへの依頼は以下に限る:
+          - 既存バケットの bucket policy がクロスアカウント read を拒否して
+            いる場合の許可追加
+          - バケットが KMS CMK で暗号化されている場合の cross-account
+            kms:Decrypt grant 追加
+          - 既存 lifecycle ルールが <CONTEXT_PREFIX> 配下を削除しないことの
+            確認
+      acceptance_criteria:
+        - id: "AC-003-1"
+          description: |
+            Reporter Lambda が AssumeRole 後の S3 client で
+            s3://<bucket>/<CONTEXT_PREFIX>/<PROFILE_FILE> を GetObject
+            できること。
+        - id: "AC-003-2"
+          description: |
+            運用 Lambda の関数 zip / image の sha256、実行 Role の policy、
+            CI/CD パイプライン定義に本仕様起因の差分がゼロであること。
+
+    # ─── Config と load_config ───
+
+    - id: "REQ-004"
+      title: "configs/<正規化 alarm 名>.yaml と load_config() で AWS インフラ情報を引き当てる"
+      description: |
+        受信した alarm に対応する AWS インフラ情報を、リポジトリ内
+        configs/<正規化 alarm 名>.yaml から load_config() で引き当てる。
+        中央集権的なレジストリインデックスファイルは持たない。
+
+        命名規約:
+          configs/<正規化 alarm 名>.yaml がその alarm の Config を表す。
+          正規化 alarm 名 = normalize_alarm_name(alarm_name) の結果。
+
+        configs/*.yaml の必須フィールド (Config dataclass と 1:1):
+          function_name                              (str)
+          account_id                                 (str)
+          aws_region                                 (str)
+          assume_role_arn                            (str)
+          log_group                                  (str)
+          profile_location                           (str, S3 URI)
+          bedrock_model_id                           (str)
+          bedrock_max_tokens                         (int)
+          cloudwatch_logs_query_poll_interval_sec    (float)
+
+        configs/*.yaml には観測ロジック (signal_kind 名等) を一切書かない。
+        観測ロジックは profile (REQ-002) に集約する。
+
+        既存の config/alarm_log_groups.yml は本仕様完了時点で削除する
+        (configs/*.yaml に統合される)。
+      acceptance_criteria:
+        - id: "AC-004-1"
+          description: |
+            load_config(alarm_name) が SNS event の AlarmName のみを入力として
+            外部 API 呼び出し無しに Config を返せること。
+        - id: "AC-004-2"
+          description: |
+            load_config("hdw-sakura-test") と load_config("hdw-sakura") が
+            同一 configs/hdw-sakura.yaml を読み、同一フィールド値の Config を
+            返すこと。
+        - id: "AC-004-3"
+          description: |
+            configs/<正規化名>.yaml が不在、または YAML がスキーマ違反のとき、
+            FileNotFoundError ではなく明示例外 (ConfigSchemaError 相当) を
+            投げ、main 側で REQ-008 (a) フォールバックに分岐できること。
+        - id: "AC-004-4"
+          description: |
+            Config dataclass のフィールド集合に observation 系
+            (signal_kind 名等) が含まれていないこと (責務分離の検査)。
+
+    # ─── signal_kind 解決 ───
+
+    - id: "REQ-005"
+      title: "signal_kind を呼び出し側コードで決定論的に解決する"
+      description: |
+        alarm 1 件に対応する signal_kind の選択は LLM ではなく Reporter
+        Lambda のコードが決定論的に行う。解決経路:
+
+          1. normalized = normalize_alarm_name(alarm_name)
+          2. signal_entry = profile.signal で name == normalized なものを探す
+          3. signal_entry が見つからない場合 → REQ-008 (b) フォールバック
+          4. kind_name = signal_entry.kind
+          5. signal_kind = profile.signal_kind で name == kind_name なものを探す
+          6. signal_kind が見つからない or type != verdict → REQ-008 (b)
+             フォールバック (AC-002-3 で本来弾かれるが防御的に扱う)
+          7. 解決した signal_kind 1 個のみを動的コンテキストに埋め込む
+
+        ignored 系シグナルは別途 profile.signal_kind から type=ignored を
+        全て抽出し動的コンテキストの「障害根拠としない情報」セクションに
+        含める (REQ-001 / REQ-008 と別経路)。
+      acceptance_criteria:
+        - id: "AC-005-1"
+          description: |
+            動的コンテキストの「権威シグナル」セクションに含まれる
+            signal_kind が常に 1 個であること (複数 signal_kind の混入禁止)。
+        - id: "AC-005-2"
+          description: |
+            次のいずれかで REQ-008 (b) フォールバックに倒れること:
+              - signal[] に normalized alarm 名のエントリが存在しない
+              - signal[].kind が signal_kind[] に存在しない
+              - 指された signal_kind の type が verdict でない
+            (3 ケース個別に動作確認)
+        - id: "AC-005-3"
+          description: |
+            正規化前の生 alarm 名 ("hdw-sakura-test") で profile.signal[] を
+            引き当てる経路が存在しないこと (= 必ず normalize 経由)。
+
+    # ─── Insights クエリ ───
+
+    - id: "REQ-006"
+      title: "Insights クエリを input_identifiers から動的に生成する"
+      description: |
+        現状の Reporter Lambda は Insights クエリ文字列に ship_name 等の
+        フィールド名をハードコードしている。本 REQ では profile.input_identifiers
+        を参照してクエリを実行時に合成する。
+
+          - fields 句: 既定固定フィールド (@timestamp, @message, level,
+            function_request_id 等) + input_identifiers を結合
+          - filter 句: input_identifiers の先頭フィールドを絞り込みキーに使う
+            (例: filter ship_name = "{value}")
+
+        絞り込み値の出どころは v1 では「SNS event の AlarmName から正規表現で
+        抽出した識別子値」(現状の ship_name 相当)。クエリ自体の設計・最適化は
+        スコープ外 (既存実装を踏襲)。
+      acceptance_criteria:
+        - id: "AC-006-1"
+          description: |
+            profile.input_identifiers を別リスト (例: [vessel_id, ingest_at])
+            に差し替えた状態で、Insights クエリの fields 句と filter 句が
+            新識別子名に切り替わること。Reporter Lambda の Python ソース
+            コードに差分がないこと。
+        - id: "AC-006-2"
+          description: |
+            input_identifiers が空配列のときスキーマ違反として弾かれること
+            (REQ-002 AC-002-1)。
+
+    # ─── 出力 JSON スキーマ ───
+
+    - id: "REQ-007"
+      title: "Bedrock 出力 JSON スキーマと字数制限を統一する"
+      description: |
+        Bedrock 応答の JSON スキーマを以下に統一する。
+
+          {
+            "verdict":    enum [healthy, failed, absent],
+            "severity":   enum [HIGH, MEDIUM, LOW],
+            "confidence": enum [high, medium, low],
+            "summary":    string (<= 80 字。冒頭で verdict を識別),
+            "detail":     string (<= 300 字),
+            "actions": [
+              { "phase": enum [即時対応, 調査手順, 恒久対策],
+                "text":  string (<= 80 字) }
+            ]
+          }
+
+        既存の root_cause_hypothesis / suggested_actions (文字列リスト) は
+        廃止し上記スキーマで完全置換する (REQ-012)。
+
+        字数制限はシステムプロンプトに明記し、Bedrock 応答後の正規化処理で
+        コード側でも超過分を truncate する (二重防御)。
+      acceptance_criteria:
+        - id: "AC-007-1"
+          description: |
+            Bedrock 応答 JSON のキー集合が
+            {verdict, severity, confidence, summary, detail, actions} と
+            一致すること。
+        - id: "AC-007-2"
+          description: |
+            summary > 80 字 / detail > 300 字 / actions[*].text > 80 字 が
+            正規化処理で truncate されること (通知欠落を起こさない)。
+        - id: "AC-007-3"
+          description: |
+            actions の各要素が { phase, text } の構造を持ち、phase が
+            列挙値 (即時対応 / 調査手順 / 恒久対策) のいずれかに揃って
+            いること。違反は正規化処理でスキップ。
+
+    # ─── フォールバック ───
+
+    - id: "REQ-008"
+      title: "フォールバックを 2 系統で実装し、汎用 signal_kind で続行する"
+      description: |
+        以下の 2 系統を区別し、いずれも通知欠落させずに fallback_generic で
+        Bedrock 呼び出しを継続する。
+
+          (a) プロファイル未登録時:
+              - configs/<正規化名>.yaml が不在 (ConfigNotFoundError)
+              - configs/<正規化名>.yaml がスキーマ違反 (ConfigSchemaError)
+              - profile YAML が S3 から取得できない (BotoCore / Client error)
+              - profile YAML がスキーマ違反 (ProfileSchemaError)
+
+          (b) signal_kind 解決失敗時 (REQ-005):
+              - profile.signal[] に該当 alarm 名のエントリ無し
+              - signal[].kind が signal_kind[] に不在 (整合性違反、AC-002-3
+                で本来弾かれるが防御的に扱う)
+              - 指された signal_kind の type != verdict
+
+        fallback_generic の具体内容 (コード定数):
+          {
+            "name": "fallback_generic",
+            "type": "verdict",
+            "mechanism": "metric",
+            "locator": "CloudWatch メトリクス AWS/Lambda Errors",
+            "success_condition": "時間窓内に Errors > 0 のサンプルが存在しない",
+            "failure_condition": "Errors > 0、または stack_trace/traceback が
+                                  抽出ログに存在",
+            "absence_hypothesis": "Lambda invocation 自体が発生しておらず、
+                                   メトリクスもログも生成されていない可能性",
+            "max_severity_on_success": "MEDIUM",
+            "severity_on_absence": "MEDIUM",
+          }
+
+        フォールバック発動は Powertools logger.warning に記録し、Discord embed
+        の補助表示 (footer 等) に「fallback: profile_missing」or
+        「fallback: signal_unresolved」の印を表示する。
+      acceptance_criteria:
+        - id: "AC-008-1"
+          description: |
+            (a) のいずれかの状態 (4 ケース: config 不在 / config スキーマ違反 /
+            S3 GetObject 失敗 / profile スキーマ違反) で Reporter Lambda が
+            例外で落ちず Discord に通知が届き、印 "fallback: profile_missing"
+            が含まれること。
+        - id: "AC-008-2"
+          description: |
+            (b) のいずれかの状態 (3 ケース: signal[] 不在 / kind 名 不在 /
+            type != verdict) で通知が届き、印 "fallback: signal_unresolved"
+            が含まれること。(a) と (b) の印が区別できること。
+        - id: "AC-008-3"
+          description: |
+            既存の AssumeRole 失敗 / Insights クエリ失敗 / Bedrock API 失敗時の
+            fallback (cross-account-architecture PRIN-003 由来) と動作干渉
+            しないこと。
+
+    # ─── severity 補正 ───
+
+    - id: "REQ-009"
+      title: "severity を signal_kind のポリシーで補正する"
+      description: |
+        Bedrock 応答を取得した後、コード側で以下の補正を行う:
+
+          - verdict == "healthy":
+              response.severity = clamp(response.severity,
+                                         max=signal_kind.max_severity_on_success)
+          - verdict == "absent":
+              response.severity = signal_kind.severity_on_absence
+              response.confidence = "low"  (メタ手続き既定値)
+          - verdict == "failed":
+              response.severity = "HIGH"  (メタ手続き既定値 / 補正不要)
+
+        signal_kind は REQ-005 で解決した 1 個。fallback_generic 採用時は
+        その max_severity_on_success / severity_on_absence を使う (=
+        いずれも MEDIUM)。
+
+        clamp ロジック: severity は HIGH > MEDIUM > LOW の順序を持つ。
+        ceiling より上の severity をceiling に丸める。
+      acceptance_criteria:
+        - id: "AC-009-1"
+          description: |
+            Bedrock 応答 verdict=healthy / severity=HIGH +
+            signal_kind.max_severity_on_success=MEDIUM のとき、最終 severity が
+            MEDIUM になること。
+        - id: "AC-009-2"
+          description: |
+            Bedrock 応答 verdict=absent / severity=LOW +
+            signal_kind.severity_on_absence=MEDIUM のとき、最終 severity が
+            MEDIUM、confidence が low に上書きされること。
+        - id: "AC-009-3"
+          description: |
+            verdict=failed のとき severity が補正されないこと (HIGH のまま)。
+
+    # ─── レポートレンダリング ───
+
+    - id: "REQ-010"
+      title: "レポートヘッダーをコード側でレンダリングする"
+      description: |
+        Discord 通知のレポートで、ヘッダー (Title / Target / ResearchWindow /
+        Alarm) は Reporter Lambda が入力情報から決定論的にレンダリングする。
+        LLM 出力に依存しない (ハルシネーション防止)。
+
+        レンダリングテンプレート (Discord embed 構造に対応付ける):
+
+          Title  (embed.title):       summary を昇格して使う
+                                       (verdict 識別の冒頭文言を含む)
+          Target (embed field):       config.function_name
+          ResearchWindow (field):     research_window (JST フォーマット)
+          Alarm (field):              "{alarm_name} [{alarm_description}]"
+
+          Report(Summary) (field):    response.summary
+          Report(Detail)  (field):    response.detail
+
+          Action (field):             3 行構造:
+                                       [即時対応] {actions[即時対応].text}
+                                       [調査手順] {actions[調査手順].text}
+                                       [恒久対策] {actions[恒久対策].text}
+                                      該当 phase の action が無い場合は
+                                      "(なし)" を表示する。
+
+        embed.color は severity に応じる:
+          HIGH = 0xE74C3C (赤) / MEDIUM = 0xF1C40F (黄) / LOW = 0x2ECC71 (緑)
+          (現状 src/main.py の DISCORD_SEVERITY_COLOR を踏襲)
+
+        フォールバック印 (REQ-008) は embed.footer に表示する:
+          "fallback: profile_missing" or "fallback: signal_unresolved"
+      acceptance_criteria:
+        - id: "AC-010-1"
+          description: |
+            Bedrock 応答モックを空 (全フィールド null) にした状態でも、
+            ヘッダー (Target / ResearchWindow / Alarm) が正しく描画され、
+            LLM 起因のフィールドだけが「(不明)」相当に丸まること。
+        - id: "AC-010-2"
+          description: |
+            actions 配列が空 or 一部 phase 欠落の場合、Action field の該当
+            行が "(なし)" として描画されること。
+
+    # ─── 既存ロジックの廃止 / 後方互換 ───
+
+    - id: "REQ-011"
+      title: "既存のケース分岐ロジックを廃止する"
+      description: |
+        現状 src/utils/prompt.py の render_prompt_case_no_logs /
+        render_prompt_case_lambda_failure による 2 分岐ロジックを廃止する。
+          - no_logs (空ログ早期 return) は廃止し、verdict=absent として
+            Bedrock に判断させる
+          - lambda_failure ケースの Step1〜4 手順はシステムプロンプトの
+            メタ手続き (REQ-001) に昇格させる
+        Bedrock 呼び出し自体が技術的に失敗するケース (AssumeRole 失敗 /
+        Insights クエリ失敗 / Bedrock API 失敗) のフォールバックは引き続き
+        残す (cross-account-architecture PRIN-003)。
+      acceptance_criteria:
+        - id: "AC-011-1"
+          description: |
+            src/utils/prompt.py から render_prompt_case_no_logs と
+            render_prompt_case_lambda_failure が完全削除されていること
+            (grep ヒット 0 件、コメントアウト残置も無いこと)。
+        - id: "AC-011-2"
+          description: |
+            空ログ時に Bedrock 呼び出しが発生し、verdict=absent の応答が
+            得られること (現状の no_logs 早期 return が撤廃されている)。
+
+    - id: "REQ-012"
+      title: "後方互換ハック・移行用フォールバックを残さない"
+      description: |
+        破壊的変更を伴う実装のため、新旧の切替フラグ、コメントアウト残置、
+        // removed コメントを置かない。constitution PRIN-XXX (簡素優先) に
+        準拠。
+      acceptance_criteria:
+        - id: "AC-012-1"
+          description: |
+            既存の root_cause_hypothesis / suggested_actions キーを Discord
+            embed 組み立てが参照する経路が完全削除されていること
+            (src/ 配下 grep ヒット 0 件)。
+
+    # ─── 設定の整理 (Env 全廃止) ───
+
+    - id: "REQ-013"
+      title: "Env dataclass を全廃止し、Config + DISCORD_WEBHOOK_URLS に二分する"
+      description: |
+        現状の src/main.py の Env dataclass を全廃止する。
+
+        (1) configs/<正規化 alarm 名>.yaml に格納する設定:
+            function_name / account_id / aws_region / assume_role_arn /
+            log_group / profile_location / bedrock_model_id /
+            bedrock_max_tokens / cloudwatch_logs_query_poll_interval_sec
+
+        (2) Lambda env var として残す唯一のキー:
+            DISCORD_WEBHOOK_URLS (REQ-016)
+
+        廃止する env var:
+            CROSS_ACCOUNT_ROLE_ARN / TARGET_FUNCTION_NAME / BEDROCK_MODEL_ID /
+            BEDROCK_MAX_TOKENS / ENVIRONMENT_NAME /
+            CLOUDWATCH_LOGS_QUERY_POLL_INTERVAL_SEC / DISCORD_WEBHOOK_URL /
+            LOG_GROUP_MAP
+
+        ENVIRONMENT_NAME は alarm 名末尾 "-test" 有無で導出できるため廃止。
+        EXTERNAL_ID は cross-account-architecture v3.4.0 で廃止済み。
+      acceptance_criteria:
+        - id: "AC-013-1"
+          description: |
+            src/main.py から Env dataclass の定義および全フィールドの
+            os.environ 参照が削除されていること。DISCORD_WEBHOOK_URLS の
+            参照のみが残る。
+        - id: "AC-013-2"
+          description: |
+            Lambda environment に DISCORD_WEBHOOK_URLS のみ残し、他の旧
+            env var を全削除した状態でアラーム解析 → Discord 通知が成立する
+            こと。
+        - id: "AC-013-3"
+          description: |
+            GitHub Actions のデプロイジョブから廃止対象 env var の配信処理
+            (secrets / vars 参照) が削除され、DISCORD_WEBHOOK_URLS のみが
+            配信されること。
+        - id: "AC-013-4"
+          description: |
+            src/ 配下から ENVIRONMENT_NAME 文字列および environment_name 変数
+            が完全削除され、Discord embed の test/prod 表記が alarm 名末尾
+            "-test" から導出するヘルパー経由で出力されていること。
+
+    # ─── 新規アラーム追加手順 ───
+
+    - id: "REQ-014"
+      title: "新規アラーム追加時のデプロイ手順を確定する"
+      description: |
+        本仕様完了後、新規 alarm 追加時の手順を 2 ケースで PLAN に文書化する。
+
+        手順 (全ケース共通):
+          1. configs/<正規化 alarm 名>.yaml を新規作成し PR → merge
+          5. DISCORD_WEBHOOK_URLS の JSON 辞書に正規化後 alarm 名 → URL を追加
+          6. Reporter Lambda 再ビルド + 再デプロイ
+
+        新クライアント追加時の追加手順:
+          2. クライアント S3 に <PROFILE_FILE> を手動 put
+          3. クライアント側 AssumeRole Role に S3 GetObject / ListBucket /
+             (必要なら) kms:Decrypt grant 追加
+          4. クライアント側 SNS Topic / CloudWatch Alarm 配線
+             (cross-account-architecture PLAN を踏襲)
+
+        既存クライアントの新アラーム追加時は手順 2〜4 をスキップ。
+      acceptance_criteria:
+        - id: "AC-014-1"
+          description: |
+            PLAN に 2 ケース (新クライアント / 既存クライアント新アラーム) の
+            手順が分岐記載されていること。
+        - id: "AC-014-2"
+          description: |
+            手順に「運用 Lambda のコード・実行 IAM Role・CI/CD パイプライン
+            定義に変更を加えない」不変条件が明記されていること
+            (REQ-003 AC-003-2 の継続)。
+        - id: "AC-014-3"
+          description: |
+            手順 3 / 4 (クライアント側作業) と手順 1 / 5 / 6 (自社側作業) の
+            所在が明示されていること。
+        - id: "AC-014-4"
+          description: |
+            手順 1 (configs/*.yaml 作成) と手順 5 (DISCORD_WEBHOOK_URLS 更新)
+            の両方が必要であること、片方欠落時の失敗モード
+            (REQ-008 (a) / REQ-016 AC-016-3 フォールバック) が明示されている
+            こと。
+
+    # ─── load_config 実装 ───
+
+    - id: "REQ-015"
+      title: "load_config() と Config dataclass を実装する"
+      description: |
+        src/utils/config.py を新設し、以下を実装する:
+
+          - Config dataclass (frozen, slots)
+          - normalize_alarm_name(alarm_name: str) -> str
+          - load_config(alarm_name: str) -> Config
+          - 例外クラス: ConfigNotFoundError / ConfigSchemaError
+
+        load_config() の手順:
+          1. normalize_alarm_name() で正規化
+          2. /var/task/configs/<正規化名>.yaml (Lambda 環境) または
+             プロジェクトルートの configs/<正規化名>.yaml (ローカル) を解決
+          3. yaml.safe_load() で読込
+          4. 必須フィールド検証 (型 + 存在)
+          5. Config dataclass にロードして返す
+
+        cold start で一括ロードはせず、main 呼び出しごとに都度読む
+        (configs/ がコンテナイメージ同梱で安価、かつ Lambda の concurrent
+        実行で異なる alarm を受け取る可能性に備える)。
+      acceptance_criteria:
+        - id: "AC-015-1"
+          description: |
+            load_config("hdw-sakura") と load_config("hdw-sakura-test") が
+            同一 Config を返すこと (-test 正規化の動作確認)。
+        - id: "AC-015-2"
+          description: |
+            必須 9 フィールド (REQ-013 description) が全て型付きで Config に
+            格納されること。
+        - id: "AC-015-3"
+          description: |
+            ファイル不在で ConfigNotFoundError、スキーマ違反 (フィールド欠落 /
+            型違反 / YAML 構文エラー) で ConfigSchemaError が投げられ、main
+            側で REQ-008 (a) フォールバックに分岐できる構造であること。
+
+    # ─── DISCORD_WEBHOOK_URLS ───
+
+    - id: "REQ-016"
+      title: "DISCORD_WEBHOOK_URLS の JSON 辞書スキーマと解決経路"
+      description: |
+        Lambda env var DISCORD_WEBHOOK_URLS は以下のスキーマで保持する:
+          - 値: JSON 文字列 (UTF-8)
+          - パース後: dict[str, str]
+          - キー: 正規化後 alarm 名
+          - 値: Discord webhook URL
+
+        Reporter Lambda は cold start で json.loads → モジュールスコープの
+        dict にキャッシュする。アラーム受信時に
+        dict[normalize_alarm_name(alarm_name)] で URL を引く。キー不在は
+        Lambda が例外で落ちず、CloudWatch Logs に warning 記録のみで正常
+        終了する (Discord 通知欠落)。
+      acceptance_criteria:
+        - id: "AC-016-1"
+          description: |
+            不正 JSON を設定した状態で cold start すると明確なエラーで fail
+            する (silent failure としない)。
+        - id: "AC-016-2"
+          description: |
+            "hdw-sakura" / "hdw-sakura-test" の両 alarm が辞書内単一
+            エントリ "hdw-sakura" の URL に解決されること。
+        - id: "AC-016-3"
+          description: |
+            キー不在の alarm を受信時、Lambda が例外で落ちず、CloudWatch
+            Logs に "webhook 未登録" の warning が記録されること。
+        - id: "AC-016-4"
+          description: |
+            DISCORD_WEBHOOK_URLS の辞書キーに "-test" 末尾を含む文字列が
+            存在しないこと。検出時は warning ログ。
+
+    # ─── pre_classification ───
+
+    - id: "REQ-017"
+      title: "pre_classification を動的コンテキストに埋め込む"
+      description: |
+        動的コンテキストの「アラーム情報」セクションに pre_classification
+        フィールドを含める。値は解決済み signal_kind.name をコード側が
+        決定論的に設定する。
+
+        値の取りうるパターン:
+          - 通常解決成功: signal_kind.name (例: "completion_success" / "latency")
+          - REQ-008 (a) フォールバック: "fallback_generic"
+          - REQ-008 (b) フォールバック: "fallback_generic"
+
+        Bedrock への補助ヒントとして冗長だが (権威シグナル本体に name は
+        既に含まれる)、ヘッダ可読性のために残す。
+      acceptance_criteria:
+        - id: "AC-017-1"
+          description: |
+            動的コンテキストの「アラーム情報」セクションに
+            "pre_classification: {value}" の行が含まれること。
+        - id: "AC-017-2"
+          description: |
+            pre_classification の値が、その動的コンテキストに埋め込まれた
+            signal_kind の name フィールドと完全一致すること。
+        - id: "AC-017-3"
+          description: |
+            フォールバック発動時の pre_classification が "fallback_generic"
+            であること。
+
+    # ─── 1:1 制約 ───
+
+    - id: "REQ-018"
+      title: "1 アラーム = 1 signal_kind の前提を維持する"
+      description: |
+        1 つの alarm に対し、解決される signal_kind (type=verdict) は 1 個に
+        限る。「Errors または高レイテンシ」のような複合条件を 1 つのアラームで
+        監視するケースは v1 スコープ外とし、必要なら複数アラームに分割する。
+
+        スキーマ上の表現:
+          - profile.signal[] の各 name は単一 kind 値を持つ (1:1)
+          - 動的コンテキストに含まれる権威シグナルは常に 1 個 (AC-005-1)
+      acceptance_criteria:
+        - id: "AC-018-1"
+          description: |
+            profile スキーマ検証で同一 signal[].name が複数行に存在する場合、
+            スキーマ違反として弾かれること。
+        - id: "AC-018-2"
+          description: |
+            動的コンテキストに権威シグナルが 2 個以上含まれることが無いこと
+            (AC-005-1 と一体)。
+
+  scope_out:
+    - "実行完了系以外のアラームクラス (コスト異常 / レイテンシ SLO バーンレート /
+       GuardDuty 等)。verdict の意味も failure_taxonomy も変わるため別解析
+       プロファイルとして切り出す。"
+    - "CloudWatch Logs Insights のクエリ自体の設計・最適化 (既存の抽出処理を
+       流用する)。"
+    - "ケース判定 / 件数集計 / request_id 抽出 / deeplink 生成
+       (呼び出し側で実施済みの前提を継続)。"
+    - "複数アラームの同時発火に対するクロス相関・集約。本設計では 1 アラーム =
+       1 Bedrock 呼び出し = 1 レポートとして各々独立に解析する (相関分析や 1 通
+       への集約は行わない)。"
+    - "Phase B / C 以降の所有権移譲 (運用 Lambda チームへの profile 管理移譲、
+       CI/CD 連携)。Reporter Lambda 側の契約は不変に保つ設計で吸収する。"
+
+  phase2_integration_note: |
+    本仕様の出力 JSON (verdict / severity / confidence / failure_taxonomy 等)
+    は将来拡張 (フェーズ 2) の連携点となる。具体的には:
+      - 失敗かつコードバグ濃厚 (verdict=failed / failure_taxonomy=b1) のケースで
+        実ソースコードを用いた AI コード深掘り解析
+      - クライアント影響のある重大事象 (severity=HIGH + 該当 alarm) で
+        クライアント向けメール文面生成 (人間承認を挟む)
+    上記は別 issue「アラーム解析レポート後段パイプライン」で扱う。本 SPEC は
+    出力 JSON のスキーマ安定性 (verdict / severity / confidence / failure_taxonomy
+    enum 値) を Phase 2 への契約として保つ責務を負う。

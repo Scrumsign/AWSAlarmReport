@@ -1,0 +1,10 @@
+id: llm-output-chaining
+spec_version: 0.1.0
+rev: 1
+open_decisions:
+  - id: O-1
+    title: chain_context の永続化手段
+    current_lean: 別 spec で定義
+  - id: O-2
+    title: LLM が YAML を出力しない場合のリカバリ
+    current_lean: スキップ（コンテキストなし継続）を優先

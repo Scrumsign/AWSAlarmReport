@@ -1,0 +1,49 @@
+id: client-email-notification
+spec_version: 0.3.0
+rev: 2
+tasks:
+  - id: TASK-001
+    title: Message dataclass と Channel 基底クラスの実装
+    req: REQ-002
+    depends_on: []
+    done_criterion: src/channels/message.py と src/channels/base.py が存在し mypy エラーがない
+  - id: TASK-002
+    title: DiscordChannel の実装（既存コードの移植）
+    req: REQ-002
+    depends_on: [TASK-001]
+    done_criterion: DiscordChannel.send(message) が既存と同等の Discord embed を送信する。main.py から discord_webhook の直接呼び出しが削除される
+  - id: TASK-003
+    title: error-routing.yml の作成と読み込み実装
+    req: REQ-005
+    depends_on: []
+    done_criterion: _load_error_routing() が {error_id:entry} を返し、不在時に WARNING + ["discord"] を返す
+  - id: TASK-004
+    title: email.yaml の作成と resolve_addresses 実装
+    req: REQ-006
+    depends_on: []
+    done_criterion: resolve_addresses(group_id, groups) が group_id に対応するアドレスリストを返す。group_id 不在時は [] + WARNING
+  - id: TASK-005
+    title: SESEmailChannel の骨格実装
+    req: REQ-001, REQ-002
+    depends_on: [TASK-001, TASK-004]
+    done_criterion: SESEmailChannel(group_id) が id="email.<group_id>" を返し、send() が SES send_email を呼ぶ。アドレスリスト空時は WARNING + スキップ
+  - id: TASK-006
+    title: HTML テンプレートの実装
+    req: REQ-003, REQ-004
+    depends_on: [TASK-005]
+    done_criterion: _to_html() に ship_name・JST タイムスタンプ・severity・actions が含まれる
+  - id: TASK-007
+    title: Channel ディスパッチの実装（error-routing.yml 連携）
+    req: REQ-002, REQ-005, REQ-007
+    depends_on: [TASK-002, TASK-003, TASK-005]
+    done_criterion: _dispatch() が channel_ids から _build_channel_registry でレジストリを構築し、email.* を動的に解決して送信する。一方失敗でも他方継続
+  - id: TASK-008
+    title: IAM ポリシーと SES セットアップ（インフラ）
+    req: REQ-001
+    depends_on: []
+    done_criterion: Lambda 実行ロールに ses:SendEmail/ses:SendRawEmail が付与。サンドボックス解除済み
+  - id: TASK-009
+    title: Dockerfile と deploy.yml のデプロイ設定更新
+    req: REQ-005, REQ-006
+    depends_on: [TASK-003, TASK-004]
+    done_criterion: config/error-routing.yml と config/email.yaml が Lambda コンテナイメージに含まれる

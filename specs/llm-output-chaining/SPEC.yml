@@ -1,0 +1,55 @@
+id: llm-output-chaining
+version: 0.1.0
+status: draft
+requirements:
+  - id: REQ-001
+    title: 出力フォーマット規約
+    ac:
+      - id: AC-001-1
+        description: LLM は summary / severity / confidence / pattern / root_cause_hypothesis / suggested_actions / chain_context の 7 フィールドを YAML 形式で出力する
+      - id: AC-001-2
+        description: chain_context はコメント行付きで出力末尾に配置される
+      - id: AC-001-3
+        description: システムプロンプトの出力スキーマ定義が YAML 形式に更新されている
+
+  - id: REQ-002
+    title: chain_context の内容規約
+    ac:
+      - id: AC-002-1
+        description: chain_context は alarm_name / fired_at / pattern / root_cause_summary / key_technical_clues / severity / confidence の 7 フィールドを含む
+      - id: AC-002-2
+        description: root_cause_summary は 50 文字以内
+      - id: AC-002-3
+        description: key_technical_clues は最大 3 件、各項目 80 文字以内
+      - id: AC-002-4
+        description: pattern は "A" または "B" の文字列
+
+  - id: REQ-003
+    title: 抽出規約
+    ac:
+      - id: AC-003-1
+        description: YAML パースで chain_context フィールドを抽出できる
+      - id: AC-003-2
+        description: パース失敗・フィールド欠損の場合は None として扱い処理を継続する
+      - id: AC-003-3
+        description: 必須フィールド（pattern / root_cause_summary / severity）のいずれかが欠損している場合もコンテキストなし扱いとする
+
+  - id: REQ-004
+    title: 入力埋め込み規約
+    ac:
+      - id: AC-004-1
+        description: chain_context はシステムプロンプト冒頭に「# 前回の解析結果」セクションとして埋め込まれる
+      - id: AC-004-2
+        description: chain_context が存在しない場合、該当セクションはプロンプトに含まれない
+      - id: AC-004-3
+        description: 埋め込みは YAML ブロックとしてそのまま挿入する
+
+  - id: REQ-005
+    title: ライフサイクル規約
+    ac:
+      - id: AC-005-1
+        description: 引き継ぐのは直前の 1 世代のみ（累積しない）
+      - id: AC-005-2
+        description: TTL は 24 時間とする（前回アラーム発火時刻から起算）
+      - id: AC-005-3
+        description: TTL 超過の場合はコンテキストなし扱いとする

@@ -1,0 +1,63 @@
+id: client-email-notification
+version: 0.3.0
+status: draft
+requirements:
+  - id: REQ-001
+    title: Amazon SES でメールを送信する
+    ac:
+      - id: AC-001-1
+        description: Lambda 実行ロールに ses:SendEmail / ses:SendRawEmail 権限が付与されている
+      - id: AC-001-2
+        description: SES サンドボックスが解除されており、任意の外部アドレスへ送信できる
+      - id: AC-001-3
+        description: 送信元アドレスが @scrumsign.com ドメインから送られる（O-2 確定後）
+  - id: REQ-002
+    title: S3データ不着検知時にクライアントへメールを送る
+    ac:
+      - id: AC-002-1
+        description: S3データ不着アラームが発火したとき、解決されたアドレスリスト全件にメールが送信される
+      - id: AC-002-2
+        description: SESEmailChannel.send() が例外を送出しても DiscordChannel.send() は実行される
+  - id: REQ-003
+    title: 通知メールに船舶名と未着確認時刻を含める
+    ac:
+      - id: AC-003-1
+        description: メール本文に ship_name が含まれる
+      - id: AC-003-2
+        description: メール本文にアラーム発火時刻が含まれる（JST 表記）
+  - id: REQ-004
+    title: メールの HTML テンプレートを実装する
+    ac:
+      - id: AC-004-1
+        description: SES へのリクエストに Body.Html と Body.Text の両方が含まれる
+      - id: AC-004-2
+        description: HTML メールに ship_name・未着確認時刻・severity・推奨アクションが含まれる
+  - id: REQ-005
+    title: エラー種別ごとに通知チャネルを設定ファイルで制御できる
+    ac:
+      - id: AC-005-1
+        description: error-routing.yml の channels リストを変更するとディスパッチ先が変わる
+      - id: AC-005-2
+        description: 対象の error_id エントリが存在しない場合、discord のみにフォールバックし WARNING ログが出る
+  - id: REQ-006
+    title: メールアドレスグループを設定ファイルで定義し、エラー種別ごとに送信グループを指定できる
+    ac:
+      - id: AC-006-1
+        description: email.yaml のグループのアドレスリストを変更するとそのグループの送信先が変わる
+      - id: AC-006-2
+        description: error-routing.yml に email.dev と指定された場合、email.yaml の dev キーのアドレスリストが使われる
+      - id: AC-006-3
+        description: email.<group_id> の group_id が email.yaml に存在しない場合、送信をスキップし WARNING ログが出る
+  - id: REQ-007
+    title: ルーティングアルゴリズムによる3段階ディスパッチ
+    ac:
+      - id: AC-007-1
+        description: _resolve_error_id("hdw-sakura") は "s3_data_missing" を返す
+      - id: AC-007-2
+        description: error_id が error-routing.yml に存在しない場合、["discord"] にフォールバックし WARNING ログが出る
+      - id: AC-007-3
+        description: channel_id が解決できない場合、そのチャネルをスキップし WARNING ログが出る
+      - id: AC-007-4
+        description: Channel.send() が例外を送出しても、次のチャネルへの送信が継続される
+      - id: AC-007-5
+        description: いかなるフォールバック・例外が発生しても Lambda は正常終了する（エラーを再 raise しない）
