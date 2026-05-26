@@ -1,7 +1,7 @@
 ---
 id: client-email-notification
 spec_version: 0.5.0
-rev: 1
+rev: 2
 title: S3データ不着検知時のクライアントへのメール通知 — 実装タスク
 created_at: 2026-05-26
 type: task
@@ -10,7 +10,7 @@ type: task
 # S3データ不着検知時のクライアントへのメール通知 — 実装タスク
 
 - **SPEC**: client-email-notification@0.5.0
-- **rev**: 1
+- **rev**: 2
 
 ## 実装順序（依存関係）
 
@@ -29,7 +29,7 @@ TASK-008（SES / IAM セットアップ）: 並列実施可
 
 ## タスク一覧
 
-### TASK-001: Message dataclass と Channel 基底クラスの実装
+### TASK-001: Message dataclass と Channel 基底クラスの実装 ✅
 
 - **REQ**: REQ-002
 - **依存**: なし
@@ -69,7 +69,7 @@ class Channel(ABC):
 
 ---
 
-### TASK-002: DiscordChannel の実装（既存コードの移植）
+### TASK-002: DiscordChannel の実装（既存コードの移植） ✅
 
 - **REQ**: REQ-002
 - **依存**: TASK-001
@@ -100,28 +100,29 @@ DISCORD_SEVERITY_COLOR: dict[str, int] = {
 }
 
 class DiscordChannel(Channel):
-    def __init__(self, webhook_url: str) -> None:
+    # 実装時に environment_name / target_function_name を追加（embed の author / field 表示用）
+    def __init__(
+        self,
+        webhook_url: str,
+        environment_name: str,
+        target_function_name: str,
+    ) -> None:
         self._webhook_url = webhook_url
+        self._environment_name = environment_name
+        self._target_function_name = target_function_name
 
     @property
     def id(self) -> str:
         return "discord"
 
     def send(self, message: Message) -> None:
-        embed = self._to_embed(message)
-        webhook = DiscordWebhook(url=self._webhook_url)
-        webhook.add_embed(embed)
-        webhook.execute()
-
-    def _to_embed(self, message: Message) -> DiscordEmbed:
-        # severity → color マッピング（DISCORD_SEVERITY_COLOR を使用）
-        # title / fields / footer を Message から組み立てる
-        # ※ 件数・集計時間窓・deeplinks は Message に含まれないため embed に出さない
+        # severity → color、author/fields/timestamp を Message から組み立てて Webhook 送信
+        ...
 ```
 
 ---
 
-### TASK-003: error-profiles.yml の作成と読み込み・_resolve_error_id の実装
+### TASK-003: error-profiles.yml の作成と読み込み・_resolve_error_id の実装 ✅
 
 - **REQ**: REQ-005, REQ-007
 - **依存**: なし
@@ -130,11 +131,10 @@ class DiscordChannel(Channel):
 実装ガイド:
 ```yaml
 # config/error-profiles.yml
+# 現時点では全エントリが discord のみ。SES 設定完了後に email.scrumsign 等を追加する。
 - id: s3_data_missing
   channels:
     - discord
-    - email.dev
-    - email.sakura
   description: |
     S3へのデータ不着を検知しました。対象Lambdaの実行ログが存在しないため、Lambda自体が起動していません。
     原因として、クライアント側のアップロード失敗またはイベントトリガー設定の不備が考えられます。
@@ -142,8 +142,6 @@ class DiscordChannel(Channel):
 - id: lambda_failure
   channels:
     - discord
-    - email.dev
-    - email.sakura
   description: |
     対象Lambdaが起動しましたが、処理中にエラーが発生しました。
     CloudWatch Logsにstatus=errorのログが記録されています。
@@ -195,23 +193,20 @@ def _resolve_error_id(alarm_name: str, log_rows: list) -> str:
 
 ---
 
-### TASK-004: email.yaml の作成と resolve_addresses の実装
+### TASK-004: email.yaml の作成と resolve_addresses の実装 ✅
 
 - **REQ**: REQ-006
 - **依存**: なし
-- **完了基準**: `config/email.yaml` が存在する。`resolve_addresses("dev", entries)` が `add` リストを返す。group_id が存在しない場合は `[]` を返し WARNING ログが出る
+- **完了基準**: `config/email.yaml` が存在する。`resolve_addresses("scrumsign", entries)` が `add` リストを返す。group_id が存在しない場合は `[]` を返し WARNING ログが出る
 
 実装ガイド:
 ```yaml
 # config/email.yaml  — リスト of dict 形式
-- id: dev
+# 現時点では社内（scrumsign）グループのみ定義。クライアント向けは SES 設定完了後に追加。
+- id: scrumsign
   add:
-    - alerts@scrumsign.com
-
-- id: sakura
-  add:
-    - captain@sakura-shipping.com
-    - ops@sakura-shipping.com
+    - kitamura@scrumsign.com
+    - t.kimura@scrumsign.com
 ```
 
 ```python
@@ -226,7 +221,7 @@ def resolve_addresses(group_id: str, entries: list[dict]) -> list[str]:
 
 ---
 
-### TASK-005: SESEmailChannel の骨格実装
+### TASK-005: SESEmailChannel の骨格実装 ✅
 
 - **REQ**: REQ-001, REQ-002
 - **依存**: TASK-001, TASK-004
@@ -268,7 +263,7 @@ class SESEmailChannel(Channel):
 
 ---
 
-### TASK-006: HTML・プレーンテキストテンプレートの実装
+### TASK-006: HTML・プレーンテキストテンプレートの実装 ✅
 
 - **REQ**: REQ-003, REQ-004
 - **依存**: TASK-005
@@ -301,7 +296,7 @@ def _to_plain(self, message: Message) -> str:
 
 ---
 
-### TASK-007: _dispatch と main.py への統合
+### TASK-007: _dispatch と main.py への統合 ✅
 
 - **REQ**: REQ-002, REQ-005, REQ-007
 - **依存**: TASK-002, TASK-003, TASK-005
@@ -319,9 +314,14 @@ from src.channels.message import Message
 from src.channels.discord import DiscordChannel
 from src.channels.email import SESEmailChannel
 
-def _build_channel_registry(channel_ids: list[str]) -> dict[str, Channel]:
+# 実装時に env: Env を引数に追加（DiscordChannel の初期化に必要）
+def _build_channel_registry(channel_ids: list[str], env: Env) -> dict[str, Channel]:
     registry: dict[str, Channel] = {
-        "discord": DiscordChannel(webhook_url=os.environ["DISCORD_WEBHOOK_URL"]),
+        "discord": DiscordChannel(
+            webhook_url=env.discord_webhook_url,
+            environment_name=env.environment_name,
+            target_function_name=env.target_function_name,
+        ),
     }
     for cid in channel_ids:
         if cid.startswith("email."):
@@ -329,10 +329,10 @@ def _build_channel_registry(channel_ids: list[str]) -> dict[str, Channel]:
             registry[cid] = SESEmailChannel(group_id=group_id)
     return registry
 
-def _dispatch(alarm_name: str, message: Message, error_id: str) -> None:
+def _dispatch(alarm_name: str, message: Message, error_id: str, env: Env) -> None:
     profiles    = _load_error_profiles()
     channel_ids = _resolve_channel_ids(error_id, profiles)
-    registry    = _build_channel_registry(channel_ids)
+    registry    = _build_channel_registry(channel_ids, env)
 
     for cid in channel_ids:
         channel = registry.get(cid)
@@ -386,26 +386,21 @@ _dispatch(alarm_name, message, error_id)
 
 ---
 
-### TASK-008: IAM ポリシーと SES セットアップ（インフラ）
+### TASK-008: IAM ポリシーと SES セットアップ（インフラ） 🔄 一部完了
 
 - **REQ**: REQ-001
 - **依存**: なし（並列実施可）
 - **完了基準**: Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` が付与されている。SES サンドボックスが解除されており任意アドレスへの送信が可能
 
-以下を実施する（AWS コンソール / CLI 作業）:
-1. SES コンソールで `scrumsign.com` ドメインを登録・DKIM CNAME レコード（3件）を DNS に追加
-2. AWS Support へサンドボックス解除申請を送信
-3. Lambda 実行ロールに IAM インラインポリシーを追加:
+| # | 作業 | 状態 |
+|---|---|---|
+| 1 | `scrumsign.com` を SES に Identity 登録（DKIM トークン発行） | ✅ 完了（2026-05-26） |
+| 2 | Sandbox 解除申請を AWS に送信 | ✅ 送信済み（PENDING・審査中） |
+| 3 | Lambda 実行ロール（`hdw-lambda-execution-role`）に `ses:SendEmail` / `ses:SendRawEmail` 追加 | ✅ 完了（2026-05-26） |
+| 4 | さくらのコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | ❌ 保留 |
+| 5 | 送信元アドレス確定後 `SES_FROM_ADDRESS` を deploy.yml 環境変数に追加 | ❌ 保留（アドレス未確定） |
 
-```json
-{
-  "Effect": "Allow",
-  "Action": ["ses:SendEmail", "ses:SendRawEmail"],
-  "Resource": "arn:aws:ses:<region>:<account-id>:identity/scrumsign.com"
-}
-```
-
-4. `SES_FROM_ADDRESS` を Lambda 環境変数に追加（例: `alerts@scrumsign.com`）
+詳細は `specs/client-email-notification/REPORT-001.md` を参照。
 
 ---
 

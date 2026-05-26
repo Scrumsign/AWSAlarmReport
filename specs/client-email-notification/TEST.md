@@ -1,8 +1,8 @@
 ---
 id: client-email-notification
 spec_version: 0.5.0
-task_rev: 1
-rev: 1
+task_rev: 2
+rev: 2
 title: S3データ不着検知時のクライアントへのメール通知 — テスト項目
 created_at: 2026-05-26
 type: test
@@ -11,8 +11,8 @@ type: test
 # S3データ不着検知時のクライアントへのメール通知 — テスト項目
 
 - **SPEC**: client-email-notification@0.5.0
-- **TASK rev**: 1
-- **TEST rev**: 1
+- **TASK rev**: 2
+- **TEST rev**: 2
 
 ## 方針
 
@@ -72,27 +72,28 @@ def test_message_is_frozen():
 **なぜ重要**: 既存 Discord 通知の継続性を保証する。main.py からの discord_webhook 依存が残っていないことも確認する。
 
 ```python
+def make_discord_channel():
+    # 実装時に environment_name / target_function_name が必須引数として追加された
+    return DiscordChannel(
+        webhook_url="https://example.com",
+        environment_name="test",
+        target_function_name="hdw-test-fn",
+    )
+
 def test_discord_channel_send_calls_webhook(mocker):
     mock_execute = mocker.patch("src.channels.discord.DiscordWebhook.execute")
-    ch = DiscordChannel(webhook_url="https://example.com")
-    ch.send(make_message(severity="HIGH"))
+    make_discord_channel().send(make_message(severity="HIGH"))
     mock_execute.assert_called_once()
 
 def test_to_embed_color_by_severity():
-    ch = DiscordChannel(webhook_url="https://example.com")
+    ch = make_discord_channel()
     for sev, color in DISCORD_SEVERITY_COLOR.items():
         embed = ch._to_embed(make_message(severity=sev))
         assert embed.color == color
 
 def test_to_embed_title_contains_message_title():
-    ch = DiscordChannel(webhook_url="https://example.com")
-    embed = ch._to_embed(make_message(title="テスト通知"))
+    embed = make_discord_channel()._to_embed(make_message(title="テスト通知"))
     assert "テスト通知" in embed.title
-
-def test_to_embed_footer_contains_alarm_name():
-    ch = DiscordChannel(webhook_url="https://example.com")
-    embed = ch._to_embed(make_message(alarm_name="hdw-sakura"))
-    assert "hdw-sakura" in embed.footer.text
 ```
 
 ```bash
@@ -165,11 +166,12 @@ def test_resolve_error_id_unknown_alarm(caplog):
 
 ```python
 def test_resolve_addresses_returns_add_list():
-    entries = [{"id": "dev", "add": ["a@x.com", "b@x.com"]}]
-    assert resolve_addresses("dev", entries) == ["a@x.com", "b@x.com"]
+    # 実装時のグループ名は "scrumsign"
+    entries = [{"id": "scrumsign", "add": ["kitamura@scrumsign.com", "t.kimura@scrumsign.com"]}]
+    assert resolve_addresses("scrumsign", entries) == ["kitamura@scrumsign.com", "t.kimura@scrumsign.com"]
 
 def test_resolve_addresses_missing_group_returns_empty(caplog):
-    entries = [{"id": "dev", "add": ["a@x.com"]}]
+    entries = [{"id": "scrumsign", "add": ["kitamura@scrumsign.com"]}]
     result = resolve_addresses("missing", entries)
     assert result == []
     assert caplog.records  # WARNING が出ていること
@@ -354,12 +356,13 @@ def test_build_channel_registry_skips_unknown_prefix():
 
 **なぜ重要**: IAM 権限不足と SES サンドボックスは unit テストでは検知できない。デプロイ前に必ず確認する。
 
-| AC | 確認内容 | 確認方法 |
-|---|---|---|
-| AC-001-1 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` が付与されている | `aws iam get-role-policy` またはコンソール確認 |
-| AC-001-2 | SES サンドボックスが解除されており外部アドレスへ送信できる | SES コンソールの Account dashboard |
-| AC-001-3 | 送信元アドレスが `@scrumsign.com` ドメイン | `aws ses get-identity-verification-attributes --identities scrumsign.com` |
-| — | 実際にテストメールが届く | `aws ses send-email --from alerts@scrumsign.com --to <自アドレス> ...` |
+| AC | 確認内容 | 状態 | 確認方法 |
+|---|---|---|---|
+| AC-001-1 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` が付与されている | ✅ 完了 | `aws iam get-role-policy --role-name hdw-lambda-execution-role --policy-name SESendEmail` |
+| AC-001-2 | `scrumsign.com` が SES Identity として登録されている | ✅ 完了 | `aws sesv2 get-email-identity --email-identity scrumsign.com` |
+| AC-001-3 | DKIM CNAME レコード3件が DNS に登録されている | ❌ 保留 | `nslookup -type=CNAME j3ldawn4rjhlsvzybb3273ut23c2cyx4._domainkey.scrumsign.com` |
+| AC-001-4 | SES サンドボックスが解除されており外部アドレスへ送信できる | 🔄 PENDING | SES コンソールの Account dashboard |
+| AC-001-5 | 実際にテストメールが届く | ❌ 未実施（AC-001-3/4 完了後） | `aws sesv2 send-email --from-email-address <確定アドレス> --destination ToAddresses=<宛先> ...` |
 
 ---
 
