@@ -50,7 +50,7 @@ class SESEmailChannel(Channel):
 
     email.yaml で定義したグループ ID に対応する宛先リストを初期化時に解決し、
     HTML + プレーンテキストのマルチパートメールを SES で送信する。
-    送信元アドレスは環境変数 SES_FROM_ADDRESS から取得する。
+    送信元アドレスは環境変数 AWS_SES_FROM_ADDRESS から取得する。
     """
 
     def __init__(self, group_id: str) -> None:
@@ -70,7 +70,7 @@ class SESEmailChannel(Channel):
         """Message を HTML / プレーンテキストのマルチパートメールで送信する。
 
         宛先アドレスが空の場合は WARNING を出力してスキップする。
-        送信元は環境変数 SES_FROM_ADDRESS で指定する。
+        送信元は環境変数 AWS_SES_FROM_ADDRESS で指定する。
         """
         if not self._addresses:
             logger.warning(
@@ -79,7 +79,7 @@ class SESEmailChannel(Channel):
             )
             return
         boto3.client("ses").send_email(
-            Source=os.environ["SES_FROM_ADDRESS"],
+            Source=os.environ["AWS_SES_FROM_ADDRESS"],
             Destination={"ToAddresses": self._addresses},
             Message={
                 "Subject": {"Data": message.title, "Charset": "UTF-8"},

@@ -62,7 +62,7 @@ def test_to_plain_contains_required_fields(mocker):
 
 
 def test_send_email_has_html_and_text_body(mocker, monkeypatch):
-    monkeypatch.setenv("SES_FROM_ADDRESS", "alerts@scrumsign.com")
+    monkeypatch.setenv("AWS_SES_FROM_ADDRESS", "alerts@scrumsign.com")
     mock_client = mocker.patch("channels.email.boto3.client")
     make_channel(mocker).send(make_message())
     body = mock_client.return_value.send_email.call_args[1]["Message"]["Body"]

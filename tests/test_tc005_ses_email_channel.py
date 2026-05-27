@@ -32,7 +32,7 @@ def test_ses_channel_id(mocker):
 
 
 def test_ses_send_calls_send_email(mocker, monkeypatch):
-    monkeypatch.setenv("SES_FROM_ADDRESS", "alerts@scrumsign.com")
+    monkeypatch.setenv("AWS_SES_FROM_ADDRESS", "alerts@scrumsign.com")
     mocker.patch("channels.email._load_email_config", return_value=[])
     mocker.patch("channels.email.resolve_addresses", return_value=["a@x.com"])
     mock_client = mocker.patch("channels.email.boto3.client")
