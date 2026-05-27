@@ -1,7 +1,7 @@
 id: client-email-notification
 spec_version: 0.3.0
 task_rev: 2
-rev: 2
+rev: 3
 test_cases:
   - id: TC-001
     task: TASK-001

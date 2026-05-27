@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+VALID_SEVERITIES: frozenset[str] = frozenset({"HIGH", "MEDIUM", "LOW"})
+
+
 @dataclass(frozen=True)
 class Message:
     """チャネル間で共有する通知メッセージのデータ構造。

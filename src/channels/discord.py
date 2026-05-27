@@ -124,12 +124,17 @@ class DiscordChannel(Channel):
         return "discord"
 
     def send(self, message: Message) -> None:
-        """Message を Discord Embed としてフォーマットし Webhook で投稿する。
+        """Message を Discord Embed としてフォーマットし Webhook で投稿する。"""
+        webhook = DiscordWebhook(url=self._webhook_url)
+        webhook.add_embed(self._to_embed(message))
+        webhook.execute()
+
+    def _to_embed(self, message: Message) -> DiscordEmbed:
+        """Message を DiscordEmbed に変換する。
 
         severity が DISCORD_SEVERITY_COLOR に存在しない場合はグレー（0x95A5A6）を使う。
         actions が空の場合は推奨アクションフィールドを省略する。
         """
-        webhook = DiscordWebhook(url=self._webhook_url)
         color = DISCORD_SEVERITY_COLOR.get(message.severity, 0x95A5A6)
         embed = DiscordEmbed(title=message.title[:256], color=color)
         embed.set_author(name=f"HDW Notify · {self._environment_name}")
@@ -153,5 +158,4 @@ class DiscordChannel(Channel):
             )
 
         embed.set_timestamp(message.timestamp)
-        webhook.add_embed(embed)
-        webhook.execute()
+        return embed
