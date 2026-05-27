@@ -82,10 +82,12 @@ jobs:
           FUNCTION_NAME: ${{ vars.AWS_LAMBDA_FUNCTION_NAME }}
           CONFIG_FILE: deploy/config.yml
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SES_FROM_ADDRESS: ${{ secrets.AWS_SES_FROM_ADDRESS }}
         run: |
           set -euo pipefail
 
           : "${DISCORD_WEBHOOK_URL:?secret DISCORD_WEBHOOK_URL is required}"
+          : "${SES_FROM_ADDRESS:?secret AWS_SES_FROM_ADDRESS is required}"
           test -f "$CONFIG_FILE" || { echo "config file not found: $CONFIG_FILE" >&2; exit 1; }
 
           echo "Source config: $CONFIG_FILE"
@@ -98,8 +100,10 @@ jobs:
           ENV_JSON=$(jq -n \
             --argjson c "$CONFIG_JSON" \
             --arg DISCORD_WEBHOOK_URL "$DISCORD_WEBHOOK_URL" \
+            --arg SES_FROM_ADDRESS "$SES_FROM_ADDRESS" \
             '{Variables: {
               DISCORD_WEBHOOK_URL: $DISCORD_WEBHOOK_URL,
+              SES_FROM_ADDRESS: $SES_FROM_ADDRESS,
               ENVIRONMENT_NAME: ($c.environment_name | tostring),
               TARGET_FUNCTION_NAME: ($c.target_function_name | tostring),
               CROSS_ACCOUNT_ROLE_ARN: ($c.aws_cross_account_role_arn | tostring),
