@@ -110,7 +110,7 @@ scrumsign.com   nameserver = 03.dnsv.jp
 scrumsign.com   nameserver = 04.dnsv.jp
 ```
 
-`dnsv.jp` はさくらインターネットのネームサーバーであり、`scrumsign.com` の DNS 権威はさくらにある。AWS はさくらの DNS に直接レコードを追加できないため、**ドメイン管理者がさくらのコントロールパネルで手動追加する**必要がある。
+`dnsv.jp` はお名前.com のネームサーバーであり、`scrumsign.com` の DNS 権威はお名前.com にある。AWS はお名前.com の DNS に直接レコードを追加できないため、**ドメイン管理者がお名前.com Navi のコントロールパネルで手動追加する**必要がある。
 
 ### CNAME を設定しない場合との比較
 

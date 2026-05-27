@@ -51,7 +51,7 @@ SES が以下の3件の CNAME レコードを発行した。
 
 | # | 作業 | 担当 | 状態 |
 |---|---|---|---|
-| 1 | さくらのコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | 手動 | 未実施 |
+| 1 | お名前.com のコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | 手動 | 未実施 |
 | 2 | Sandbox 解除の審査通過を待つ | AWS | PENDING |
 | 3 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` 権限を追加 | 手動 | 未実施 |
 | 4 | 送信元アドレス確定後、`SES_FROM_ADDRESS` を deploy.yml の環境変数に追加 | コード | 未実施 |
