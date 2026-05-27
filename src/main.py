@@ -33,11 +33,11 @@ import yaml
 from aws_lambda_powertools import Logger
 from botocore.exceptions import BotoCoreError, ClientError
 from channels.discord import (
-    DISCORD_SEVERITY_COLOR,
     DiscordChannel,
     _post_minimal_embed,
     _post_prompt_attachment,
 )
+from channels.message import VALID_SEVERITIES
 from channels.email import SESEmailChannel
 from channels.message import Message
 
@@ -337,7 +337,7 @@ def _normalize_report(report: dict[str, Any]) -> dict[str, Any]:
     安全な既定値へ丸める。
     """
     severity = str(report.get("severity") or "MEDIUM").upper()
-    if severity not in DISCORD_SEVERITY_COLOR:
+    if severity not in VALID_SEVERITIES:
         severity = "MEDIUM"
 
     actions = report.get("suggested_actions")

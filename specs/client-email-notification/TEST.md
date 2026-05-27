@@ -2,7 +2,7 @@
 id: client-email-notification
 spec_version: 0.5.0
 task_rev: 2
-rev: 2
+rev: 3
 title: S3データ不着検知時のクライアントへのメール通知 — テスト項目
 created_at: 2026-05-26
 type: test
@@ -12,7 +12,7 @@ type: test
 
 - **SPEC**: client-email-notification@0.5.0
 - **TASK rev**: 2
-- **TEST rev**: 2
+- **TEST rev**: 3
 
 ## 方針
 
