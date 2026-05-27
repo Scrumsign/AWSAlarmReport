@@ -14,7 +14,7 @@
 `scrumsign.com` を SES の送信元 Identity として登録した。
 DKIM 署名方式は Easy DKIM（RSA 2048 bit）を選択。
 
-**ステータス**: `NOT_STARTED`（DNS レコード追加待ち）
+**ステータス**: `NOT_STARTED`（CNAME 追加済み・DNS 伝播待ち）
 
 ---
 
@@ -51,7 +51,7 @@ SES が以下の3件の CNAME レコードを発行した。
 
 | # | 作業 | 担当 | 状態 |
 |---|---|---|---|
-| 1 | お名前.com のコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | 手動 | 未実施 |
+| 1 | お名前.com のコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | 手動 | ✅ 完了（2026-05-27）DNS 伝播待ち |
 | 2 | Sandbox 解除の審査通過を待つ | AWS | PENDING |
-| 3 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` 権限を追加 | 手動 | 未実施 |
+| 3 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` 権限を追加 | 手動 | ✅ 完了（2026-05-26） |
 | 4 | 送信元アドレス確定後、`SES_FROM_ADDRESS` を deploy.yml の環境変数に追加 | コード | 未実施 |

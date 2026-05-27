@@ -397,7 +397,7 @@ _dispatch(alarm_name, message, error_id)
 | 1 | `scrumsign.com` を SES に Identity 登録（DKIM トークン発行） | ✅ 完了（2026-05-26） |
 | 2 | Sandbox 解除申請を AWS に送信 | ✅ 送信済み（PENDING・審査中） |
 | 3 | Lambda 実行ロール（`hdw-lambda-execution-role`）に `ses:SendEmail` / `ses:SendRawEmail` 追加 | ✅ 完了（2026-05-26） |
-| 4 | お名前.com のコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | ❌ 保留 |
+| 4 | お名前.com のコントロールパネルで DKIM CNAME レコード3件を DNS に追加 | ✅ 完了（2026-05-27）DNS 伝播待ち |
 | 5 | 送信元アドレス確定後 `SES_FROM_ADDRESS` を deploy.yml 環境変数に追加 | ❌ 保留（アドレス未確定） |
 
 詳細は `specs/client-email-notification/REPORT-001.md` を参照。

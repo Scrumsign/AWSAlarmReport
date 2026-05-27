@@ -360,7 +360,7 @@ def test_build_channel_registry_skips_unknown_prefix():
 |---|---|---|---|
 | AC-001-1 | Lambda 実行ロールに `ses:SendEmail` / `ses:SendRawEmail` が付与されている | ✅ 完了 | `aws iam get-role-policy --role-name hdw-lambda-execution-role --policy-name SESendEmail` |
 | AC-001-2 | `scrumsign.com` が SES Identity として登録されている | ✅ 完了 | `aws sesv2 get-email-identity --email-identity scrumsign.com` |
-| AC-001-3 | DKIM CNAME レコード3件が DNS に登録されている | ❌ 保留（お名前.com で追加が必要） | `nslookup -type=CNAME j3ldawn4rjhlsvzybb3273ut23c2cyx4._domainkey.scrumsign.com` |
+| AC-001-3 | DKIM CNAME レコード3件が DNS に登録されている | 🔄 DNS 伝播待ち（2026-05-27 追加済み） | `nslookup -type=CNAME j3ldawn4rjhlsvzybb3273ut23c2cyx4._domainkey.scrumsign.com` |
 | AC-001-4 | SES サンドボックスが解除されており外部アドレスへ送信できる | 🔄 PENDING | SES コンソールの Account dashboard |
 | AC-001-5 | 実際にテストメールが届く | ❌ 未実施（AC-001-3/4 完了後） | `aws sesv2 send-email --from-email-address <確定アドレス> --destination ToAddresses=<宛先> ...` |
 
