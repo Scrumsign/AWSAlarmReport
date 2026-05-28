@@ -12,14 +12,17 @@ from channels.message import Message
 
 def make_message(**kwargs) -> Message:
     defaults = dict(
-        title="テスト通知",
         severity="HIGH",
         confidence="high",
+        business_summary="テスト業務説明",
         root_cause="原因",
+        technical_observation="観測事実",
+        technical_hypothesis="仮説",
         actions=[],
         alarm_name="hdw-sakura",
         ship_name="sakura",
         timestamp=datetime(2026, 5, 26, 10, 0, tzinfo=timezone.utc),
+        error_id="lambda_failure",
     )
     defaults.update(kwargs)
     return Message(**defaults)
@@ -40,7 +43,7 @@ def test_to_html_contains_required_fields(mocker):
     )
     html = make_channel(mocker)._to_html(msg)
     assert "sakura" in html
-    assert "HIGH" in html
+    assert "重要" in html
     assert "JST" in html
     assert "2026" in html
     assert "アクション1" in html
@@ -56,7 +59,7 @@ def test_to_plain_contains_required_fields(mocker):
     )
     plain = make_channel(mocker)._to_plain(msg)
     assert "sakura" in plain
-    assert "LOW" in plain
+    assert "情報" in plain
     assert "JST" in plain
     assert "アクション1" in plain
 

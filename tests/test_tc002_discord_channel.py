@@ -12,14 +12,17 @@ from channels.message import Message
 
 def make_message(**kwargs) -> Message:
     defaults = dict(
-        title="テスト通知",
         severity="HIGH",
         confidence="high",
+        business_summary="テスト業務説明",
         root_cause="原因",
+        technical_observation="観測事実",
+        technical_hypothesis="仮説",
         actions=[],
         alarm_name="hdw-sakura",
         ship_name="sakura",
         timestamp=datetime(2026, 5, 26, tzinfo=timezone.utc),
+        error_id="lambda_failure",
     )
     defaults.update(kwargs)
     return Message(**defaults)
@@ -46,6 +49,11 @@ def test_to_embed_color_by_severity():
         assert embed.color == color
 
 
-def test_to_embed_title_contains_message_title():
-    embed = make_discord_channel()._to_embed(make_message(title="テスト通知"))
-    assert "テスト通知" in embed.title
+def test_to_embed_title_contains_business_summary():
+    embed = make_discord_channel()._to_embed(make_message(business_summary="業務説明テスト"))
+    assert "業務説明テスト" in embed.title
+
+
+def test_to_embed_title_has_severity_ja_prefix():
+    embed = make_discord_channel()._to_embed(make_message(severity="HIGH"))
+    assert "重要" in embed.title

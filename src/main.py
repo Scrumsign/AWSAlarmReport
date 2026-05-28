@@ -37,7 +37,6 @@ from channels.discord import (
     _post_minimal_embed,
     _post_prompt_attachment,
 )
-from channels.message import VALID_SEVERITIES
 from channels.email import SESEmailChannel
 from channels.message import Message
 
@@ -329,26 +328,31 @@ def _build_ship_logs_insights_query(ship_name: str) -> str:
     return INSIGHTS_QUERY_TEMPLATE.format(ship_name=ship_name)
 
 
+ERROR_ID_SEVERITY: dict[str, str] = {
+    "s3_data_missing": "MEDIUM",
+    "lambda_failure": "HIGH",
+    "unknown": "MEDIUM",
+    "unknown_alarm": "LOW",
+}
+
+
 def _normalize_report(report: dict[str, Any]) -> dict[str, Any]:
     """
-    LLM 応答を Discord 投稿で扱う最小スキーマに正規化する。
+    LLM 応答を通知で扱う最小スキーマに正規化する。
 
-    JSON としては読めてもキー欠落や enum 逸脱があるケースを、通知欠落にせず
-    安全な既定値へ丸める。
+    JSON としては読めてもキー欠落があるケースを、通知欠落にせず
+    安全な既定値へ丸める。severity は含まない（error_id から固定決定）。
     """
-    severity = str(report.get("severity") or "MEDIUM").upper()
-    if severity not in VALID_SEVERITIES:
-        severity = "MEDIUM"
-
     actions = report.get("suggested_actions")
     if not isinstance(actions, list):
         actions = []
 
     return {
-        "summary": str(report.get("summary") or "LLM 分析結果の要約を取得できませんでした")[:256],
-        "severity": severity,
+        "business_summary": str(report.get("business_summary") or "")[:100],
+        "root_cause_hypothesis": str(report.get("root_cause_hypothesis") or "(不明)")[:100],
         "confidence": str(report.get("confidence") or "low"),
-        "root_cause_hypothesis": str(report.get("root_cause_hypothesis") or "(不明)"),
+        "technical_observation": str(report.get("technical_observation") or "")[:200],
+        "technical_hypothesis": str(report.get("technical_hypothesis") or "")[:200],
         "suggested_actions": [str(action) for action in actions[:3]],
     }
 
@@ -563,7 +567,7 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
             timestamp=timestamp,
             reason=reason,
             rows_count=0,
-            extra_note="AlarmName が per-ship 命名規約 (hdw-<ship>[-test]) に一致しません",
+            extra_note="想定外のアラームを受信しました（対象外の監視設定の可能性あり）",
             color=0xF1C40F,  # yellow
         )
         return {"ok": True, "alarm": alarm_name, "skipped": "invalid_alarm_name"}
@@ -582,7 +586,7 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
             timestamp=timestamp,
             reason=reason,
             rows_count=0,
-            extra_note="config/alarm_log_groups.yml に該当アラームの登録がありません",
+            extra_note="このアラームの監視対象が未登録です（システム設定の追加が必要）",
             color=0xF1C40F,  # yellow
         )
         return {"ok": True, "alarm": alarm_name, "skipped": "no_log_group_mapped"}
@@ -610,7 +614,7 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
             timestamp=timestamp,
             reason=reason,
             rows_count=0,
-            extra_note=f"クライアントログ取得用 AssumeRole 失敗: {type(e).__name__}",
+            extra_note=f"ログ取得に必要な接続に失敗しました（権限設定の確認が必要: {type(e).__name__}）",
             color=0xE74C3C,  # red
         )
         return {"ok": True, "alarm": alarm_name, "fallback": "assume_role_failed"}
@@ -648,7 +652,7 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
                 timestamp=timestamp,
                 reason=reason,
                 rows_count=0,
-                extra_note=f"CloudWatch Logs Insights 取得失敗: {query_status}",
+                extra_note=f"ログの検索に失敗しました（状態: {query_status}）",
                 color=0xF1C40F,  # yellow
             )
             return {
@@ -667,7 +671,7 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
                 timestamp=timestamp,
                 reason=reason,
                 rows_count=0,
-                extra_note="CloudWatch Logs Insights 取得がタイムアウトしました",
+                extra_note="ログの検索が時間内に完了しませんでした",
                 color=0xF1C40F,  # yellow
             )
             return {"ok": True, "alarm": alarm_name, "fallback": "insights_query_timeout"}
@@ -734,21 +738,25 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
             timestamp=timestamp,
             reason=reason,
             rows_count=len(log_rows),
-            extra_note=f"LLM 分析失敗のためコア情報のみ通知: {type(e).__name__}",
+            extra_note=f"自動分析ができませんでした。基本情報のみお知らせします（{type(e).__name__}）",
             color=0xF1C40F,  # yellow (MEDIUM 相当)
         )
         return {"ok": True, "alarm": alarm_name, "severity": "MEDIUM", "fallback": True}
 
     # --- Message 構築と全チャネルへのディスパッチ ---
+    severity = ERROR_ID_SEVERITY.get(error_id, "MEDIUM")
     message = Message(
-        title=report["summary"],
-        severity=report["severity"],
+        severity=severity,
         confidence=report["confidence"],
+        business_summary=report.get("business_summary") or "",
         root_cause=report["root_cause_hypothesis"],
+        technical_observation=report.get("technical_observation") or "",
+        technical_hypothesis=report.get("technical_hypothesis") or "",
         actions=report.get("suggested_actions") or [],
         alarm_name=alarm_name,
         ship_name=ship_name,
         timestamp=center,
+        error_id=error_id,
     )
     _dispatch(alarm_name, message, error_id, env)
     logger.info("dispatch complete", extra={"error_id": error_id})
@@ -756,5 +764,5 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     return {
         "ok": True,
         "alarm": alarm_name,
-        "severity": report.get("severity", ""),
+        "severity": severity,
     }

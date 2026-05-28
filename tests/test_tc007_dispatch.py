@@ -15,14 +15,17 @@ from main import Env, _build_channel_registry, _dispatch
 
 def make_message(**kwargs) -> Message:
     defaults = dict(
-        title="テスト通知",
         severity="HIGH",
         confidence="high",
+        business_summary="テスト業務説明",
         root_cause="原因",
+        technical_observation="観測事実",
+        technical_hypothesis="仮説",
         actions=[],
         alarm_name="hdw-sakura",
         ship_name="sakura",
         timestamp=datetime(2026, 5, 26, tzinfo=timezone.utc),
+        error_id="lambda_failure",
     )
     defaults.update(kwargs)
     return Message(**defaults)

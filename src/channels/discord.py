@@ -3,7 +3,7 @@ from __future__ import annotations
 from discord_webhook import DiscordEmbed, DiscordWebhook
 
 from channels.base import Channel
-from channels.message import Message
+from channels.message import CONFIDENCE_JA, SEVERITY_JA, Message
 
 DISCORD_SEVERITY_COLOR: dict[str, int] = {
     "LOW": 0x2ECC71,    # green
@@ -85,11 +85,11 @@ def _post_minimal_embed(
     embed = DiscordEmbed(title=extra_note[:256], color=color)
     embed.set_author(name=f"HDW Notify · {environment_name}")
 
-    embed.add_embed_field(name="監視対象 Lambda", value=target_function_name, inline=True)
-    embed.add_embed_field(name="発火 Alarm", value=alarm_name, inline=True)
-    embed.add_embed_field(name="件数", value=f"{rows_count} 件", inline=True)
+    embed.add_embed_field(name="監視対象システム", value=target_function_name, inline=True)
+    embed.add_embed_field(name="検知アラーム", value=alarm_name, inline=True)
+    embed.add_embed_field(name="取得ログ件数", value=f"{rows_count} 件", inline=True)
 
-    embed.add_embed_field(name="Alarm reason", value=reason or "(none)", inline=False)
+    embed.add_embed_field(name="アラーム理由", value=reason or "(なし)", inline=False)
     embed.set_timestamp(timestamp)
     webhook.add_embed(embed)
     webhook.execute()
@@ -132,27 +132,53 @@ class DiscordChannel(Channel):
     def _to_embed(self, message: Message) -> DiscordEmbed:
         """Message を DiscordEmbed に変換する。
 
-        severity が DISCORD_SEVERITY_COLOR に存在しない場合はグレー（0x95A5A6）を使う。
-        actions が空の場合は推奨アクションフィールドを省略する。
+        上部に業務セクション（business_summary + 原因の見立て）、
+        下部に技術セクション（発生状況 + 原因分析 + 対応の提案）を配置する。
         """
         color = DISCORD_SEVERITY_COLOR.get(message.severity, 0x95A5A6)
-        embed = DiscordEmbed(title=message.title[:256], color=color)
+        severity_ja = SEVERITY_JA.get(message.severity, message.severity)
+        confidence_ja = CONFIDENCE_JA.get(message.confidence, message.confidence)
+
+        embed = DiscordEmbed(
+            title=f"[{severity_ja}] {message.business_summary}"[:256], color=color
+        )
         embed.set_author(name=f"HDW Notify · {self._environment_name}")
 
         embed.add_embed_field(
-            name="監視対象 Lambda", value=self._target_function_name, inline=True
-        )
-        embed.add_embed_field(name="発火 Alarm", value=message.alarm_name, inline=True)
-
-        embed.add_embed_field(
-            name=f"原因仮説 (confidence: {message.confidence})",
+            name="原因の見立て",
             value=message.root_cause or "(不明)",
             inline=False,
         )
 
+        embed.add_embed_field(
+            name="── 技術詳細 ──",
+            value="​",
+            inline=False,
+        )
+
+        embed.add_embed_field(
+            name="監視対象システム", value=self._target_function_name, inline=True
+        )
+        embed.add_embed_field(name="検知アラーム", value=message.alarm_name, inline=True)
+        embed.add_embed_field(name="エラー種別", value=message.error_id, inline=True)
+
+        if message.technical_observation:
+            embed.add_embed_field(
+                name="発生状況",
+                value=message.technical_observation,
+                inline=False,
+            )
+
+        if message.technical_hypothesis:
+            embed.add_embed_field(
+                name=f"原因分析（確度: {confidence_ja}）",
+                value=message.technical_hypothesis,
+                inline=False,
+            )
+
         if message.actions:
             embed.add_embed_field(
-                name="推奨アクション",
+                name="対応の提案",
                 value="\n".join(f"- {a}" for a in message.actions),
                 inline=False,
             )

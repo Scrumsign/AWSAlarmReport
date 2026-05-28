@@ -9,7 +9,7 @@ import yaml
 from aws_lambda_powertools import Logger
 
 from channels.base import Channel
-from channels.message import Message
+from channels.message import CONFIDENCE_JA, SEVERITY_JA, Message
 
 logger = Logger()
 
@@ -78,11 +78,13 @@ class SESEmailChannel(Channel):
                 extra={"group_id": self._group_id},
             )
             return
+        severity_ja = SEVERITY_JA.get(message.severity, message.severity)
+        subject = f"[{severity_ja}] {message.business_summary}"[:128]
         boto3.client("ses").send_email(
             Source=os.environ["AWS_SES_FROM_ADDRESS"],
             Destination={"ToAddresses": self._addresses},
             Message={
-                "Subject": {"Data": message.title, "Charset": "UTF-8"},
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
                 "Body": {
                     "Html": {"Data": self._to_html(message), "Charset": "UTF-8"},
                     "Text": {"Data": self._to_plain(message), "Charset": "UTF-8"},
@@ -93,23 +95,39 @@ class SESEmailChannel(Channel):
     def _to_html(self, message: Message) -> str:
         """Message を HTML メール本文に変換して返す。タイムスタンプは JST に変換する。"""
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
+        severity_ja = SEVERITY_JA.get(message.severity, message.severity)
+        confidence_ja = CONFIDENCE_JA.get(message.confidence, message.confidence)
         actions_html = "".join(f"<li>{a}</li>" for a in message.actions)
         return (
-            f"<h2>[{message.severity}] {message.title}</h2>"
-            f"<p><b>対象</b>: {message.ship_name}</p>"
+            f"<h2>[{severity_ja}] {message.business_summary}</h2>"
+            f"<p><b>対象船舶</b>: {message.ship_name}</p>"
             f"<p><b>検知時刻</b>: {jst:%Y-%m-%d %H:%M JST}</p>"
-            f"<p><b>原因推定</b>: {message.root_cause}</p>"
+            f"<p><b>原因の見立て</b>: {message.root_cause}</p>"
+            f"<hr>"
+            f"<h3>技術詳細</h3>"
+            f"<p><b>エラー種別</b>: {message.error_id}</p>"
+            f"<p><b>発生状況</b>: {message.technical_observation}</p>"
+            f"<p><b>原因分析</b>（確度: {confidence_ja}）: {message.technical_hypothesis}</p>"
+            f"<p><b>対応の提案</b>:</p>"
             f"<ul>{actions_html}</ul>"
         )
 
     def _to_plain(self, message: Message) -> str:
         """Message をプレーンテキストのメール本文に変換して返す。タイムスタンプは JST に変換する。"""
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
+        severity_ja = SEVERITY_JA.get(message.severity, message.severity)
+        confidence_ja = CONFIDENCE_JA.get(message.confidence, message.confidence)
         actions = "\n".join(f"- {a}" for a in message.actions)
         return (
-            f"[{message.severity}] {message.title}\n"
-            f"対象: {message.ship_name}\n"
+            f"[{severity_ja}] {message.business_summary}\n"
+            f"対象船舶: {message.ship_name}\n"
             f"検知時刻: {jst:%Y-%m-%d %H:%M JST}\n"
-            f"原因推定: {message.root_cause}\n"
-            f"推奨アクション:\n{actions}"
+            f"\n"
+            f"原因の見立て:\n{message.root_cause}\n"
+            f"\n"
+            f"--- 技術詳細 ---\n"
+            f"エラー種別: {message.error_id}\n"
+            f"発生状況: {message.technical_observation}\n"
+            f"原因分析（確度: {confidence_ja}）: {message.technical_hypothesis}\n"
+            f"対応の提案:\n{actions}"
         )

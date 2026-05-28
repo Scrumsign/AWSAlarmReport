@@ -13,14 +13,17 @@ def test_message_is_frozen():
     from dataclasses import FrozenInstanceError
 
     msg = Message(
-        title="t",
         severity="HIGH",
         confidence="high",
-        root_cause="r",
+        business_summary="テスト業務説明",
+        root_cause="原因",
+        technical_observation="観測事実",
+        technical_hypothesis="仮説",
         actions=[],
         alarm_name="hdw-sakura",
         ship_name="sakura",
         timestamp=datetime(2026, 5, 26, tzinfo=timezone.utc),
+        error_id="lambda_failure",
     )
     with pytest.raises(FrozenInstanceError):
-        msg.title = "x"
+        msg.severity = "x"
