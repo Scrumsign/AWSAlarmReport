@@ -16,9 +16,10 @@ class Message:
     confidence: str              # high / medium / low
     business_summary: str        # 非技術者向け: 業務上何が起きているか
     root_cause: str              # 非技術者向け: 原因の見立て
+    business_action: str         # 非技術者向け: 業務担当者が次に取るべき行動
     technical_observation: str   # 技術者向け: ログから確認できた事実
     technical_hypothesis: str    # 技術者向け: 原因仮説と対処の方向性
-    actions: list[str]
+    technical_actions: list[str]  # 技術者向け: 具体的な対処（最大3件）
     alarm_name: str
     ship_name: str
     timestamp: datetime

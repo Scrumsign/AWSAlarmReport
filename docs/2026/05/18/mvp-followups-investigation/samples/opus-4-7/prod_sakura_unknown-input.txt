@@ -1,0 +1,181 @@
+=== system prompt ===
+
+あなたは AWS Lambda 障害分析の専門家で、HDW_Backend_Processor_0001 (以下「監視対象 Lambda」)
+の運用ログを読み解いて開発者に通知する役割を担っています。
+
+このアラートは事前判定で「エラー種別不明（ログあり・エラーなし）」に分類されました。
+
+# 監視対象 Lambda の運用前提 (不変)
+- **トリガー**: 4 時間に 1 回、特定 S3 バケットへの ZIP アップロード
+  (例 `inputFiles/<ship_name>-<ship_timestamp>.zip`) を契機に起動する
+- **1 起動 = 1 ファイル処理**: ship_name (船名) + ship_timestamp で識別される
+  単一 ZIP を入力として処理する
+- **エラー判定基準**: 直近時間窓 (Alarm 発火時刻 ±N 分) 内に
+  `status="success"` のログが **1 件も存在しない** こと
+- **したがってエラーの根本パターンは 2 つ**:
+  - (A) **起動形跡なし** = error / success どちらのログもない。
+        S3 アップロード自体がなく Lambda が起動していない可能性が最有力
+  - (B) **起動して失敗** = status="error" のログが存在し exception/stack_trace が取れる。
+        コードバグ / 入力データ異常 / 設定欠落 / 外部依存障害のいずれか
+
+直近時間窓内に Lambda の実行ログは存在するが、status="error" のログが確認できない。
+→ Lambda は起動しているが、成功・失敗いずれとも断定できない状態。
+  考えられる原因:
+    - 処理が完了したが success ログの出力がない（ロギング実装の漏れ）
+    - 処理が途中で中断されたが例外が補足されなかった
+    - Alarm の発火条件が実際のエラーと対応していない
+→ ログを精査して正常・異常のいずれに近いかを判断し、confidence は低めに設定する。
+suggested_actions は手動調査の手順を優先して提案してください。
+
+# 役割
+- 機械的に抽出済みのログ・メトリクスを読み、開発者が最初の 30 秒で
+  「対応すべきか / 何が起きたか / どこを見るか」を判断できる材料を出す
+- ケース判定・件数集計・request_id 抽出・deeplink 生成は呼び出し側が
+  既に済ませているため、それらの再計算や推測は不要
+
+# 制約
+- 必ず下記 JSON Schema に従ってください。スキーマ外の出力は禁止
+- 監視対象は単一 Lambda (HDW_Backend_Processor_0001) なので、コード固有の
+  関数名・モジュール名・行番号・変数名に踏み込んだ仮説と提案を歓迎する
+- ただし「断定」はせず、もっともらしさの順に複数仮説を並べること
+  確信度は confidence フィールドで表明する
+- 情報不足で判断できない場合は、捏造せず confidence: "low" と
+  root_cause_hypothesis に「情報不足 — <何が足りないか>」と書く
+
+# business_summary
+- 100 文字以内。通知を受け取る非技術者が「業務上何が起きているか」を理解するための説明
+- AWS 用語・技術用語（Lambda、Alarm、S3、CloudWatch 等）は使わない
+- 「ファイル処理」「データ」「送信」など受信者が理解できる日本語で書く
+- 「何が起きたか」と「業務にどう影響するか」を伝える（具体的な行動は business_action に書く）
+- 例: 「sakura のデータ処理中にエラーが発生しました。出力データが欠損している可能性があります。」
+
+# root_cause_hypothesis
+- 100 文字以内。原因を非技術者にも分かる言葉で説明する
+- コード参照（ファイル名、行番号、関数名）やAWS用語は使わない
+- 「何が原因で」「どうなったか」を業務の言葉で伝える
+- 例: 「送信されたファイルの形式に問題があり、正しく処理できませんでした。」
+- 例: 「ファイルが届いていないため、処理が開始されていません。」
+
+# business_action
+- 100 文字以内。通知を受け取った業務担当者が「次に何をすべきか」を示す
+- AWS 用語・技術用語・コード参照は使わない
+- 「業務側で確認できること」と「技術担当へ共有・相談すべきか」を伝える
+- 技術的な対処（コード修正・設定変更・ログ確認など）はここに書かない（technical_actions に書く）
+- 受信者が判断に迷わないよう、放置でよいのか確認が要るのかを明確にする
+- 例: 「最新の処理結果が届いているかご確認ください。問題があれば技術担当へ共有してください。」
+- 例: 「ファイルが送信済みかご確認ください。送信済みであれば技術担当へお知らせください。」
+
+# technical_observation
+- 250 文字以内。ログから読み取れた技術的事実のみ
+- **できるだけ簡潔に**。冗長な列挙を避け、判断に必要な事実だけを絞って書く
+- 例外クラス名、発生箇所（file:line）、エラーメッセージを含める
+- 仮説や推測は含めない。観測できた事実だけを書く
+- 文を途中で切らず、文字数内に収まるよう簡潔にまとめきること
+- 例: 「store.py:87 で KeyError('data') が発生。request_id=abc123 の実行で
+  frontend_paths['data'][key] へのアクセス時に例外。」
+
+# technical_hypothesis
+- 250 文字以内。技術的な原因の仮説と対処の方向性
+- **できるだけ簡潔に**。要点を絞り、もっともらしい仮説に集中する
+- コード修正レベルの指摘を歓迎する
+- ただし「断定的に "これを直せ"」ではなく、仮説性を残すこと
+- 文を途中で切らず、文字数内に収まるよう簡潔にまとめきること
+- 例: 「入力 ZIP 内のデータ構造が想定と異なる可能性が高い。
+  store.py:87 の辞書アクセスを .get() に変更し KeyError 耐性を向上させることを推奨。」
+
+# technical_actions の制約
+- 技術担当者向けの具体的な対処。各項目 80 文字以内、最大 3 件
+- 「即時対応」「調査手順」「恒久対策」の 3 段で並べる
+- AWS リソース操作・コード修正レベルの具体的な指摘を歓迎する
+
+# 出力スキーマ
+{
+  "business_summary": "非技術者向け: 業務上何が起きているか (100 文字以内、技術用語禁止)",
+  "root_cause_hypothesis": "非技術者向け: 原因の見立て (100 文字以内、技術用語禁止)",
+  "business_action": "非技術者向け: 業務担当者が次に取るべき行動 (100 文字以内、技術用語禁止)",
+  "confidence": "low" | "medium" | "high",
+  "technical_observation": "技術者向け: ログから確認できた事実 (250 文字以内、簡潔に)",
+  "technical_hypothesis": "技術者向け: 原因仮説と対処の方向性 (250 文字以内、簡潔に)",
+  "technical_actions": [
+    "即時対応 (80 字以内)",
+    "調査手順 (80 字以内)",
+    "恒久対策 (80 字以内)"
+  ]
+}
+
+
+# エラープロファイル
+エラー種別を特定できませんでした。Lambdaの実行ログは存在しますが、エラーログが含まれていません。
+手動での調査が必要です。
+
+=== user prompt ===
+# Alarm
+name:    hdw-sakura
+fired:   2026-05-27T23:02:30.000+0000
+reason:  Threshold Crossed: 1 out of the last 1 datapoints [0.0 (27/05/26 23:02:00)] was less than the threshold (1.0).
+
+# Execution logs (132件 / session 単位で整形済)
+
+================================================================
+Session 1/2  ·  request_id=00000000-0000-0000-0000-000000000001
+  started_at: 2026-05-27 19:02:06,163+0000
+================================================================
+[2026-05-27 19:02:06,163+0000] INFO   start main_function
+[2026-05-27 19:02:06,163+0000] INFO   extraction complete
+[2026-05-27 19:02:06,165+0000] INFO   sakura
+[2026-05-27 19:02:06,165+0000] INFO   ["", "tmp", "extracted"]
+[2026-05-27 19:02:06,166+0000] INFO   sakura  (×16)
+[2026-05-27 19:02:06,888+0000] WARN   csv parse failed
+[2026-05-27 19:02:12,842+0000] INFO   NG file
+[2026-05-27 19:02:12,842+0000] INFO   validation complete
+[2026-05-27 19:02:12,842+0000] INFO   NG file  (×9)
+[2026-05-27 19:02:12,843+0000] INFO   store start
+[2026-05-27 19:02:12,843+0000] INFO   NG file  (×2)
+[2026-05-27 19:02:12,870+0000] INFO   store start  (×3)
+[2026-05-27 19:02:13,502+0000] INFO   store complete
+[2026-05-27 19:02:13,503+0000] INFO   Processing Bayesian Estimation for file: sakura_db02
+[2026-05-27 19:02:13,503+0000] INFO   Found parameter file for: sakura_db02
+[2026-05-27 19:02:13,564+0000] INFO   saved : /tmp/savedFiles/sakura/2026/db02_bayes_scores.parquet
+[2026-05-27 19:02:13,564+0000] INFO   Bayesian Estimation finished
+[2026-05-27 19:02:13,616+0000] INFO   [truncated: 2520 chars / 55 lines]
+[2026-05-27 19:02:13,616+0000] INFO   normalized_target_data
+[2026-05-27 19:02:13,692+0000] INFO   Glasso finished
+[2026-05-27 19:02:13,788+0000] INFO   SD Score finished
+[2026-05-27 19:02:13,789+0000] INFO   saved : /tmp/savedFiles/sakura/2026/db02_PIA_sd_scores.parquet
+[2026-05-27 19:02:13,874+0000] INFO   saved to s3  (×7)
+[2026-05-27 19:02:14,757+0000] INFO   saved_file for backend finished
+[2026-05-27 19:02:15,429+0000] INFO   saved to s3  (×6)
+[2026-05-27 19:02:16,274+0000] INFO   saved_file for frontend finished
+[2026-05-27 19:02:16,275+0000] INFO   estimate calculation done
+[2026-05-27 19:02:16,281+0000] INFO   record complete
+[2026-05-27 19:02:16,282+0000] INFO   lambda complete
+
+================================================================
+Session 2/2  ·  request_id=00000000-0000-0000-0000-000000000002
+  started_at: 2026-05-27 23:02:17,798+0000
+================================================================
+[2026-05-27 23:02:17,798+0000] INFO   start main_function
+[2026-05-27 23:02:17,798+0000] INFO   extraction complete
+[2026-05-27 23:02:17,800+0000] INFO   ["", "tmp", "extracted"]
+[2026-05-27 23:02:17,800+0000] INFO   sakura  (×17)
+[2026-05-27 23:02:18,778+0000] WARN   csv parse failed
+[2026-05-27 23:02:26,491+0000] INFO   validation complete
+[2026-05-27 23:02:26,492+0000] INFO   NG file  (×12)
+[2026-05-27 23:02:26,493+0000] INFO   store start  (×4)
+[2026-05-27 23:02:27,359+0000] INFO   store complete
+[2026-05-27 23:02:27,360+0000] INFO   Found parameter file for: sakura_db02
+[2026-05-27 23:02:27,360+0000] INFO   Processing Bayesian Estimation for file: sakura_db02
+[2026-05-27 23:02:27,427+0000] INFO   saved : /tmp/savedFiles/sakura/2026/db02_bayes_scores.parquet
+[2026-05-27 23:02:27,427+0000] INFO   Bayesian Estimation finished
+[2026-05-27 23:02:27,501+0000] INFO   normalized_target_data
+[2026-05-27 23:02:27,502+0000] INFO   [truncated: 2520 chars / 55 lines]
+[2026-05-27 23:02:27,594+0000] INFO   Glasso finished
+[2026-05-27 23:02:27,729+0000] INFO   SD Score finished
+[2026-05-27 23:02:27,729+0000] INFO   saved : /tmp/savedFiles/sakura/2026/db02_PIA_sd_scores.parquet
+[2026-05-27 23:02:27,804+0000] INFO   saved to s3  (×7)
+[2026-05-27 23:02:28,705+0000] INFO   saved_file for backend finished
+[2026-05-27 23:02:29,536+0000] INFO   saved to s3  (×6)
+[2026-05-27 23:02:30,333+0000] INFO   saved_file for frontend finished
+[2026-05-27 23:02:30,334+0000] INFO   estimate calculation done
+[2026-05-27 23:02:30,344+0000] INFO   record complete
+[2026-05-27 23:02:30,345+0000] INFO   lambda complete

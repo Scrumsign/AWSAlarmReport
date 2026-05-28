@@ -16,9 +16,10 @@ def make_message(**kwargs) -> Message:
         confidence="high",
         business_summary="テスト業務説明",
         root_cause="原因",
+        business_action="確認してください",
         technical_observation="観測事実",
         technical_hypothesis="仮説",
-        actions=[],
+        technical_actions=[],
         alarm_name="hdw-sakura",
         ship_name="sakura",
         timestamp=datetime(2026, 5, 26, 10, 0, tzinfo=timezone.utc),
@@ -39,7 +40,7 @@ def test_to_html_contains_required_fields(mocker):
         ship_name="sakura",
         severity="HIGH",
         timestamp=datetime(2026, 5, 26, 10, 0, tzinfo=timezone.utc),
-        actions=["アクション1", "アクション2"],
+        technical_actions=["アクション1", "アクション2"],
     )
     html = make_channel(mocker)._to_html(msg)
     assert "sakura" in html
@@ -55,7 +56,7 @@ def test_to_plain_contains_required_fields(mocker):
         ship_name="sakura",
         severity="LOW",
         timestamp=datetime(2026, 5, 26, 10, 0, tzinfo=timezone.utc),
-        actions=["アクション1"],
+        technical_actions=["アクション1"],
     )
     plain = make_channel(mocker)._to_plain(msg)
     assert "sakura" in plain

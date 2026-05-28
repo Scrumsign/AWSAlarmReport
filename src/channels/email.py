@@ -97,18 +97,19 @@ class SESEmailChannel(Channel):
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
         severity_ja = SEVERITY_JA.get(message.severity, message.severity)
         confidence_ja = CONFIDENCE_JA.get(message.confidence, message.confidence)
-        actions_html = "".join(f"<li>{a}</li>" for a in message.actions)
+        actions_html = "".join(f"<li>{a}</li>" for a in message.technical_actions)
         return (
             f"<h2>[{severity_ja}] {message.business_summary}</h2>"
             f"<p><b>対象船舶</b>: {message.ship_name}</p>"
             f"<p><b>検知時刻</b>: {jst:%Y-%m-%d %H:%M JST}</p>"
             f"<p><b>原因の見立て</b>: {message.root_cause}</p>"
+            f"<p><b>ご対応のお願い</b>: {message.business_action}</p>"
             f"<hr>"
             f"<h3>技術詳細</h3>"
             f"<p><b>エラー種別</b>: {message.error_id}</p>"
             f"<p><b>発生状況</b>: {message.technical_observation}</p>"
             f"<p><b>原因分析</b>（確度: {confidence_ja}）: {message.technical_hypothesis}</p>"
-            f"<p><b>対応の提案</b>:</p>"
+            f"<p><b>対応の提案（技術）</b>:</p>"
             f"<ul>{actions_html}</ul>"
         )
 
@@ -117,7 +118,7 @@ class SESEmailChannel(Channel):
         jst = message.timestamp.astimezone(ZoneInfo("Asia/Tokyo"))
         severity_ja = SEVERITY_JA.get(message.severity, message.severity)
         confidence_ja = CONFIDENCE_JA.get(message.confidence, message.confidence)
-        actions = "\n".join(f"- {a}" for a in message.actions)
+        actions = "\n".join(f"- {a}" for a in message.technical_actions)
         return (
             f"[{severity_ja}] {message.business_summary}\n"
             f"対象船舶: {message.ship_name}\n"
@@ -125,9 +126,11 @@ class SESEmailChannel(Channel):
             f"\n"
             f"原因の見立て:\n{message.root_cause}\n"
             f"\n"
+            f"ご対応のお願い:\n{message.business_action}\n"
+            f"\n"
             f"--- 技術詳細 ---\n"
             f"エラー種別: {message.error_id}\n"
             f"発生状況: {message.technical_observation}\n"
             f"原因分析（確度: {confidence_ja}）: {message.technical_hypothesis}\n"
-            f"対応の提案:\n{actions}"
+            f"対応の提案（技術）:\n{actions}"
         )

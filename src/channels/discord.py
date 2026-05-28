@@ -150,6 +150,13 @@ class DiscordChannel(Channel):
             inline=False,
         )
 
+        if message.business_action:
+            embed.add_embed_field(
+                name="ご対応のお願い",
+                value=message.business_action,
+                inline=False,
+            )
+
         embed.add_embed_field(
             name="── 技術詳細 ──",
             value="​",
@@ -176,10 +183,10 @@ class DiscordChannel(Channel):
                 inline=False,
             )
 
-        if message.actions:
+        if message.technical_actions:
             embed.add_embed_field(
-                name="対応の提案",
-                value="\n".join(f"- {a}" for a in message.actions),
+                name="対応の提案（技術）",
+                value="\n".join(f"- {a}" for a in message.technical_actions),
                 inline=False,
             )
 

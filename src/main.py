@@ -343,17 +343,18 @@ def _normalize_report(report: dict[str, Any]) -> dict[str, Any]:
     JSON としては読めてもキー欠落があるケースを、通知欠落にせず
     安全な既定値へ丸める。severity は含まない（error_id から固定決定）。
     """
-    actions = report.get("suggested_actions")
+    actions = report.get("technical_actions")
     if not isinstance(actions, list):
         actions = []
 
     return {
         "business_summary": str(report.get("business_summary") or "")[:100],
         "root_cause_hypothesis": str(report.get("root_cause_hypothesis") or "(不明)")[:100],
+        "business_action": str(report.get("business_action") or "")[:100],
         "confidence": str(report.get("confidence") or "low"),
-        "technical_observation": str(report.get("technical_observation") or "")[:200],
-        "technical_hypothesis": str(report.get("technical_hypothesis") or "")[:200],
-        "suggested_actions": [str(action) for action in actions[:3]],
+        "technical_observation": str(report.get("technical_observation") or "")[:250],
+        "technical_hypothesis": str(report.get("technical_hypothesis") or "")[:250],
+        "technical_actions": [str(action) for action in actions[:3]],
     }
 
 
@@ -750,9 +751,10 @@ def main(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         confidence=report["confidence"],
         business_summary=report.get("business_summary") or "",
         root_cause=report["root_cause_hypothesis"],
+        business_action=report.get("business_action") or "",
         technical_observation=report.get("technical_observation") or "",
         technical_hypothesis=report.get("technical_hypothesis") or "",
-        actions=report.get("suggested_actions") or [],
+        technical_actions=report.get("technical_actions") or [],
         alarm_name=alarm_name,
         ship_name=ship_name,
         timestamp=center,

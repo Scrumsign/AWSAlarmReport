@@ -27,12 +27,14 @@ from pathlib import Path
 import boto3
 
 # src/ が sys.path に入っている前提 (python src/test.py 実行で自然にそうなる)
-from utils.prompt import (
-    render_prompt_case_lambda_failure,
-    render_prompt_case_no_logs,
-    render_prompt_system_base,
-    render_prompt_user,
+from main import (
+    ERROR_ID_SEVERITY,
+    _format_log_rows_pretty,
+    _load_error_profiles,
+    _normalize_report,
+    _resolve_error_id,
 )
+from utils.prompt import build_system_prompt, render_prompt_user
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 DEFAULT_SAMPLES_DIR = (
@@ -117,11 +119,15 @@ def _run_one(case_dir: Path, client, model_id: str, max_tokens: int, samples_dir
 
     log_rows = [_powertools_to_insights_row(d) for d in log_dicts]
 
-    # SPEC v1.4: log_rows の有無で機械的に 2 パターン分岐
-    case_fn = render_prompt_case_no_logs if not log_rows else render_prompt_case_lambda_failure
-    system_prompt = render_prompt_system_base(*case_fn())
-    user_prompt = render_prompt_user(alarm_name, timestamp, reason, log_rows)
+    # 本番フロー (main.py) と同じ手順で error_id を確定し system prompt を構築する
+    error_id = _resolve_error_id(alarm_name, log_rows)
+    profiles = _load_error_profiles()
+    error_description = profiles.get(error_id, {}).get("description", "")
+    system_prompt = build_system_prompt(error_id, error_description)
+    formatted_logs = _format_log_rows_pretty(log_rows)
+    user_prompt = render_prompt_user(alarm_name, timestamp, reason, formatted_logs, len(log_rows))
 
+    print(f"\n--- error_id --- {error_id}  (severity={ERROR_ID_SEVERITY.get(error_id, 'MEDIUM')})")
     print("\n--- system prompt ---")
     print(system_prompt)
     print("\n--- user prompt ---")
@@ -137,6 +143,15 @@ def _run_one(case_dir: Path, client, model_id: str, max_tokens: int, samples_dir
     usage = resp.get("usage", {})
     print("\n--- LLM raw output ---")
     print(raw)
+
+    # 本番と同じ正規化を通し、通知に乗る最終フィールドを確認する
+    try:
+        normalized = _normalize_report(json.loads(raw))
+        print("\n--- normalized (通知に乗る値) ---")
+        print(json.dumps(normalized, ensure_ascii=False, indent=2))
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"\n--- normalize 失敗: {type(e).__name__}: {e}")
+
     print(f"\n--- usage --- {usage}")
 
     # サンプル比較用に input / output を .txt に書き出す。
